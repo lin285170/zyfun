@@ -113,7 +113,10 @@ class BaiduDriver implements IPanDriver {
         headers: this.headers(ctx),
         responseType: 'json',
       });
-      return String(res.data?.result?.bdstoken ?? '');
+      // 实测：该接口的 result 可能是对象，也可能退化为数组（未登录/风控时 errno=-6）
+      const r = res.data?.result;
+      if (Array.isArray(r)) return '';
+      return String(r?.bdstoken ?? '');
     } catch {
       return '';
     }
@@ -162,6 +165,8 @@ class BaiduDriver implements IPanDriver {
         name: it.server_filename,
         size: it.size ?? 0,
         isDir: it.isdir === 1,
+        // 百度转存用 fs_id（与 fileId 同值），显式带上便于统一处理
+        token: String(it.fs_id),
       };
       if (node.isDir) {
         node.children = await this.listDir(it.path, ctx, depth + 1, randsk);
@@ -235,15 +240,25 @@ class BaiduDriver implements IPanDriver {
       headers: this.headers(ctx),
       responseType: 'json',
     });
-    const dlink = (res.data?.info ?? [])[0]?.dlink;
-    if (!dlink) throw new Error('百度未返回直链 dlink（需登录 Cookie 且已转存）');
-    return dlink as string;
+    const info = (res.data?.info ?? [])[0] ?? {};
+    if (!info.dlink) {
+      // 实测：info.errno=31021 表示该接口要求 access_token（纯 Cookie 不足）。
+      // 需要先用 BDUSS 走 OAuth 换 access_token，或改用「分享链接直下」路径。
+      if (info.errno === 31021) {
+        throw new Error(
+          '百度直链获取失败：接口要求 access_token（errno=31021）。' +
+            '需补充 OAuth 换 token 步骤，或改用分享链接直下路径。',
+        );
+      }
+      throw new Error(`百度未返回直链 dlink（info.errno=${info.errno ?? '?'}；需登录 Cookie 且已转存）`);
+    }
+    return info.dlink as string;
   }
 
   async play(
     fileId: string,
     ctx: IPanContext,
-    _share?: { shareUrl?: string; title?: string },
+    _share?: { shareUrl?: string; title?: string; token?: string },
   ): Promise<IPanPlayInfo> {
     if (!ctx.credential?.cookie) {
       throw new Error('百度网盘播放需要登录 Cookie（设置 → 网盘账号 → 百度网盘）');

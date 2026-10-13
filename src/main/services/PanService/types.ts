@@ -51,6 +51,12 @@ export interface IPanFile {
   size: number;
   /** 是否目录 */
   isDir: boolean;
+  /**
+   * 分享侧的文件令牌。
+   * 夸克的 `share_fid_token`、百度的 `fs_id` 等——**转存时必需**，
+   * 且与 `fileId` 不同：`fileId` 是分享内的 id，转存后会产生新的本地 id。
+   */
+  token?: string;
   /** 子项（目录展开后填充） */
   children?: IPanFile[];
 }
@@ -121,7 +127,16 @@ export interface IPanDriver {
   resolve(link: string, ctx: IPanContext): Promise<IPanShareResult>;
 
   /** 取播放直链 */
-  play(fileId: string, ctx: IPanContext, share?: { shareUrl?: string; title?: string }): Promise<IPanPlayInfo>;
+  play(
+    fileId: string,
+    ctx: IPanContext,
+    share?: {
+      shareUrl?: string;
+      title?: string;
+      /** 分享侧文件令牌（转存必需，取自 resolve 结果的 IPanFile.token） */
+      token?: string;
+    },
+  ): Promise<IPanPlayInfo>;
 
   /** 凭据自检（可选） */
   check?(ctx: IPanContext): Promise<boolean>;

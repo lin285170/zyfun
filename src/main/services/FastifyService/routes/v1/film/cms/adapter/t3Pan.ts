@@ -34,6 +34,7 @@ class T3PanAdapter {
   private ext: string = '';
   private source: IPanSource = { shareUrl: '' };
   private share: IPanShareResult | null = null;
+  private tokenMap: Map<string, string> | null = null;
 
   constructor(source: IConstructorOptions) {
     this.ext = source.ext!;
@@ -75,6 +76,27 @@ class T3PanAdapter {
       else out.push(f);
     }
     return out;
+  }
+
+  /**
+   * 取分享上下文（含 fileId → token 映射）。
+   *
+   * 转存需要分享侧的 token（夸克 `share_fid_token`），而 zyfun 的播放 id
+   * 只能传一个字符串，因此这里在 resolve 阶段把映射缓存起来。
+   */
+  private async shareCtx(): Promise<{ share: IPanShareResult; tokenOf: (fid: string) => string }> {
+    const share = await this.ensureShare();
+    if (!this.tokenMap) {
+      this.tokenMap = new Map();
+      const walk = (list: IPanFile[]) => {
+        for (const f of list) {
+          if (f.token) this.tokenMap!.set(f.fileId, f.token);
+          if (f.children?.length) walk(f.children);
+        }
+      };
+      walk(share.files);
+    }
+    return { share, tokenOf: (fid: string) => this.tokenMap!.get(fid) ?? '' };
   }
 
   async home(): ICmsResultPromise['home'] {
@@ -141,12 +163,15 @@ class T3PanAdapter {
     const fileId = String((doc as any).play ?? '');
     if (!fileId) throw new Error('缺少播放 id');
 
-    const share = await this.ensureShare();
+    const { share, tokenOf } = await this.shareCtx();
     const driver = panService.getDriver(this.source.driver || share.driver);
     if (!driver) throw new Error(`未找到网盘驱动：${share.driver}`);
     const ctx = await panService.context(driver.id);
-    // 同一驱动实例需要分享会话；PanService.play 内部会重新 resolve，这里直接调用驱动
-    const info = await driver.play(fileId, ctx, { shareUrl: this.source.shareUrl, title: share.title });
+    const info = await driver.play(fileId, ctx, {
+      shareUrl: this.source.shareUrl,
+      title: share.title,
+      token: tokenOf(fileId), // 转存必需：分享侧文件令牌
+    });
 
     // 经令牌代理输出，避免把网盘 Cookie 暴露到播放地址
     const url = toProxyUrl(ORIGIN || 'http://127.0.0.1', info);

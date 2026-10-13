@@ -81,13 +81,13 @@ export class PanService {
   }
 
   /** 取播放直链（自动分派） */
-  async play(link: string, fileId: string) {
+  async play(link: string, fileId: string, token?: string) {
     const driver = this.matchDriver(link);
     if (!driver) throw new Error(`暂不支持该网盘链接：${link}`);
     const ctx = await this.context(driver.id);
     // 同一驱动实例需先 resolve 建立会话（百度/夸克均依赖）
-    await driver.resolve(link, ctx);
-    return driver.play(fileId, ctx, { shareUrl: link });
+    const share = await driver.resolve(link, ctx);
+    return driver.play(fileId, ctx, { shareUrl: link, title: share.title, token });
   }
 
   /** 凭据自检 */

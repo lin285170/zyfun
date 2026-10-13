@@ -128,6 +128,7 @@ class QuarkDriver implements IPanDriver {
           name: it.file_name,
           size: it.size ?? 0,
           isDir: !!it.dir,
+          token: (it as any).share_fid_token ?? '',
         };
         if (node.isDir) {
           node.children = await this.listDir(pwdId, stoken, it.fid, ctx, depth + 1);
@@ -151,22 +152,31 @@ class QuarkDriver implements IPanDriver {
     return { title, files, shareUrl: link, driver: this.id };
   }
 
-  /** ③ 转存分享中的指定 fid 到本人网盘，返回新 fid */
+  /**
+   * ③ 转存分享项到本人网盘，返回**本人网盘侧**的新 fid。
+   *
+   * 实测要点（2026-10-13，真实账号）：
+   * - `fid_token_list` 必须与 `fid_list` 等长，token 取自 detail 的 `share_fid_token`；
+   * - 转存**同名项已存在**时 `save_as_top_fids` 会返回空，此时必须回查并 diff
+   *   本人网盘根目录；否则会继续用分享侧 fid，导致直链 21001 file not found。
+   */
   private async saveToMyDrive(
     pwdId: string,
     stoken: string,
-    fids: string[],
+    fid: string,
+    fidToken: string,
     ctx: IPanContext,
   ): Promise<string> {
-    const to = '0'; // 根目录
+    const before = await this.myRootFids(ctx);
+
     const res = await ctx.request({
       url: `${API}/share/sharepage/save?pr=ucpro&fr=pc&uc_param_str=`,
       method: 'POST',
       headers: this.headers(ctx),
       data: {
-        fid_list: fids,
-        fid_token_list: [], // 部分版本需与 fid_list 等长的 token 列表
-        to_pdir_fid: to,
+        fid_list: [fid],
+        fid_token_list: [fidToken],
+        to_pdir_fid: '0',
         pwd_id: pwdId,
         stoken,
         pdir_fid: '0',
@@ -178,10 +188,58 @@ class QuarkDriver implements IPanDriver {
     if (d.code !== 0) {
       throw new Error(`夸克转存失败：code=${d.code} msg=${d.message ?? ''}（需登录 Cookie，或该分享禁止转存）`);
     }
-    const taskId = d.data?.task_id;
-    if (taskId) await this.waitTask(taskId, ctx);
-    const saved = d.data?.save_as?.save_as_top_fids ?? [];
-    return saved[0] ?? '';
+    if (d.data?.task_id) await this.waitTask(d.data.task_id, ctx);
+
+    // 正常路径：接口直接返回新 fid
+    const direct: string[] = d.data?.save_as?.save_as_top_fids ?? [];
+    if (direct.length) return direct[0];
+
+    // 同名已存在：diff 根目录找新增项
+    const after = await this.myRootFids(ctx);
+    const added = [...after.keys()].filter((f) => !before.has(f));
+    if (added.length) return added[0];
+
+    throw new Error('夸克转存完成但无法定位新文件（网盘中已存在同名目录，可先删除后重试）');
+  }
+
+  /** 列出本人网盘根目录：Map<fid, name> */
+  private async myRootFids(ctx: IPanContext): Promise<Map<string, string>> {
+    const list = await this.myListDir('0', ctx);
+    return new Map(list.map((it: any) => [it.fid as string, it.file_name as string]));
+  }
+
+  /** 列出本人网盘某目录 */
+  private async myListDir(pdir: string, ctx: IPanContext): Promise<any[]> {
+    const qs = new URLSearchParams({
+      pr: 'ucpro',
+      fr: 'pc',
+      pdir_fid: pdir,
+      force: '0',
+      _page: '1',
+      _size: '200',
+      _fetch_total: '1',
+      _sort: 'file_type:asc,updated_at:desc',
+    });
+    const res = await ctx.request({
+      url: `${API}/file/sort?${qs.toString()}`,
+      method: 'GET',
+      headers: this.headers(ctx),
+      responseType: 'json',
+    });
+    return res.data?.data?.list ?? [];
+  }
+
+  /**
+   * 若转存进来的是目录，则下钻找到第一个可播放文件（实测分享常以剧集目录形式提供）。
+   */
+  private async resolvePlayableFid(fid: string, ctx: IPanContext, depth = 0): Promise<string> {
+    if (depth > 3) return fid;
+    const children = await this.myListDir(fid, ctx);
+    if (!children.length) return fid;
+    const file = children.find((it: any) => !it.dir);
+    if (file) return file.fid as string;
+    const sub = children.find((it: any) => it.dir);
+    return sub ? this.resolvePlayableFid(sub.fid, ctx, depth + 1) : fid;
   }
 
   /** 轮询转存任务 */
@@ -210,6 +268,13 @@ class QuarkDriver implements IPanDriver {
     });
     const d = res.data ?? {};
     if (d.code !== 0) {
+      // 实测：免费账号对大文件有下载限制，返回 23018
+      if (d.code === 23018) {
+        throw new Error(
+          '夸克直链获取失败：文件超出当前账号的下载大小限制（code=23018）。' +
+            '开源版夸克对单文件下载有上限，需开通会员或改用其他网盘。',
+        );
+      }
       throw new Error(`夸克直链获取失败：code=${d.code} msg=${d.message ?? ''}`);
     }
     const url = (d.data ?? [])[0]?.download_url;
@@ -220,21 +285,19 @@ class QuarkDriver implements IPanDriver {
   async play(
     fileId: string,
     ctx: IPanContext,
-    share?: { shareUrl?: string; title?: string },
+    share?: { shareUrl?: string; title?: string; token?: string },
   ): Promise<IPanPlayInfo> {
     if (!ctx.credential?.cookie) {
       throw new Error('夸克播放需要登录 Cookie（设置 → 网盘账号 → 夸克网盘）');
     }
     const st = (this as any)._lastStoken as { pwdId: string; stoken: string } | undefined;
-    if (!st && share?.shareUrl) {
-      const { pwdId, passcode } = this.parse(share.shareUrl);
-      st!.stoken = await this.getStoken(pwdId, passcode, ctx);
-      (this as any)._lastStoken = { pwdId, stoken: st!.stoken };
-    }
     if (!st) throw new Error('缺少分享上下文（请先调用 resolve 解析分享链接）');
 
-    const myFid = await this.saveToMyDrive(st.pwdId, st.stoken, [fileId], ctx);
-    const url = await this.getDownloadUrl([myFid || fileId], ctx);
+    // 转存到本人网盘（转存后 fid 会变，必须用返回的新 fid）
+    const myFid = await this.saveToMyDrive(st.pwdId, st.stoken, fileId, share?.token ?? '', ctx);
+    // 若转存进来的是目录，下钻到第一个可播放文件
+    const playFid = await this.resolvePlayableFid(myFid, ctx);
+    const url = await this.getDownloadUrl([playFid], ctx);
     return {
       url,
       headers: {
