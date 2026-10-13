@@ -41,7 +41,13 @@ class BaiduDriver implements IPanDriver {
   credentialFields: IPanDriver['credentialFields'] = ['cookie'];
 
   /** 每次解析的会话上下文 */
-  private session: { surl: string; shareid: string; uk: string; randsk: string; bdstoken: string } | null = null;
+  private session: {
+    surl: string;
+    shareid: string;
+    uk: string;
+    randsk: string;
+    bdstoken: string;
+  } | null = null;
 
   match(link: string): boolean {
     return LINK_RE.test(link || '');
@@ -50,8 +56,9 @@ class BaiduDriver implements IPanDriver {
   private parse(link: string): { surl: string; pwd: string } {
     const m = link.match(/\/s\/([0-9a-zA-Z_-]+)/i);
     if (!m) throw new Error('无法从链接中解析百度网盘 surl');
-    let surl = m[1];
-    if (surl.startsWith('1')) surl = surl.slice(1); // 标准短链去掉前导 1
+    // ⚠️ 实测（2026-10-13）：`api/shorturlinfo` 必须使用**完整** surl（含前导 1），
+    // 剥掉前导 1 会得到 errno=2（链接出错）。早期版本这里做了 `slice(1)`，是错误的。
+    const surl = m[1];
     const p = link.match(/[?&]pwd=([0-9a-zA-Z]{4})/i);
     return { surl, pwd: p ? p[1] : '' };
   }
@@ -68,7 +75,7 @@ class BaiduDriver implements IPanDriver {
     return h;
   }
 
-  /** ① 分享基本信息 */
+  /** ① 分享基本信息（实测：**无需 Cookie** 即可取 shareid/uk） */
   private async shortUrlInfo(surl: string, ctx: IPanContext) {
     const res = await ctx.request({
       url: `${HOST}/api/shorturlinfo?shorturl=${surl}&web=1&app_id=250528&channel=chunlei&clienttype=0`,
@@ -77,7 +84,8 @@ class BaiduDriver implements IPanDriver {
       responseType: 'json',
     });
     const d = res.data ?? {};
-    if (d.errno !== 0) {
+    // errno=0 表示无需提取码；errno=-9 表示需要提取码（此时 shareid/uk 仍然可用）
+    if (d.errno !== 0 && d.errno !== -9 && !d.shareid) {
       throw new Error(`百度分享信息获取失败：errno=${d.errno}（链接可能已失效）`);
     }
     return {
@@ -93,13 +101,19 @@ class BaiduDriver implements IPanDriver {
     const res = await ctx.request({
       url: `${HOST}/share/verify?surl=${surl}&t=${ts}&channel=chunlei&web=1&app_id=250528&clienttype=0`,
       method: 'POST',
-      headers: this.headers(ctx, { 'Content-Type': 'application/x-www-form-urlencoded' }),
-      data: `pwd=${encodeURIComponent(pwd)}`,
+      headers: this.headers(ctx, {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        // 实测：Referer 需指向分享页；指向 disk/home 会触发 errno=105
+        Referer: `${HOST}/s/${surl}`,
+        Origin: HOST,
+      }),
+      data: `pwd=${encodeURIComponent(pwd)}&vcode=&vcode_str=`,
       responseType: 'json',
     });
     const d = res.data ?? {};
     if (d.errno !== 0) {
-      throw new Error(`百度提取码校验失败：errno=${d.errno}（提取码错误或链接失效）`);
+      // 105：提取码错误，或百度风控（需稍后重试 / 更换出口 IP）
+      throw new Error(`百度提取码校验失败：errno=${d.errno}（提取码错误，或触发百度风控需稍后重试）`);
     }
     return String(d.randsk ?? '');
   }
@@ -130,16 +144,19 @@ class BaiduDriver implements IPanDriver {
     randsk: string,
   ): Promise<IPanFile[]> {
     if (depth > 4 || !this.session) return [];
-    const { surl, bdstoken } = this.session;
+    const { surl, shareid, uk, bdstoken } = this.session;
+    // 实测：用 shareid+uk 组合比 shorturl 更可靠
+    // （shorturl 形式返回 errno=140，shareid+uk 返回 errno=-9「仅差提取码验证」）
     const qs = new URLSearchParams({
-      shorturl: surl,
-      root: depth === 0 ? '1' : '0',
+      shareid,
+      uk,
       dir,
       page: '1',
       num: '100',
       order: 'time',
       desc: '1',
       showempty: '0',
+      root: depth === 0 ? '1' : '0',
       web: '1',
       channel: 'chunlei',
       app_id: '250528',
@@ -150,11 +167,20 @@ class BaiduDriver implements IPanDriver {
     const res = await ctx.request({
       url: `${HOST}/share/list?${qs.toString()}`,
       method: 'GET',
-      headers: this.headers(ctx, { Cookie: this.mergeRandsk(ctx, randsk) }),
+      headers: this.headers(ctx, {
+        Referer: `${HOST}/s/${surl}`,
+        Cookie: this.mergeRandsk(ctx, randsk),
+      }),
       responseType: 'json',
     });
     const d = res.data ?? {};
     if (d.errno !== 0) {
+      if (d.errno === -9) {
+        throw new Error('百度分享列表需要提取码：请确认链接携带 ?pwd=xxxx（errno=-9）');
+      }
+      if (d.errno === 105) {
+        throw new Error('百度提取码校验失败（errno=105）：提取码错误，或触发了百度风控需稍后重试');
+      }
       throw new Error(`百度文件列表获取失败：errno=${d.errno}（可能需要提取码或已失效）`);
     }
     const list: IBaiduListItem[] = d.list ?? [];
