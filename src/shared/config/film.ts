@@ -14,6 +14,8 @@ export const SITE_TYPE = {
   T3_APPGET: 15,
   T3_APPQI: 16,
   T3_APPFOX: 17,
+  /** 网盘直连源：ext 提供网盘分享链接，由 PanService 解析并代理播放 */
+  T3_PAN: 18,
 } as const;
 import { LOG_MODULE } from './logger';
 

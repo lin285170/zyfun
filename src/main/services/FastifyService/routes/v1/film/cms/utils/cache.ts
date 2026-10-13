@@ -18,6 +18,7 @@ import {
   T3PyAdapter,
   T3XbpqAdapter,
   T3XyqAdapter,
+  T3PanAdapter,
   T4CatvodAdapter,
   T4DrpyJs0Adapter,
   T4DrpysAdapter,
@@ -38,6 +39,7 @@ const CMS_ADAPTER_MAP = {
   [SITE_TYPE.T3_PY]: T3PyAdapter,
   [SITE_TYPE.T3_ALIST]: T3AlistAdapter,
   [SITE_TYPE.T3_CATOPEN]: T3CatopenAdapter,
+  [SITE_TYPE.T3_PAN]: T3PanAdapter,
 };
 
 class WorkLruCache<K = string, V = ICmsAdapter> extends LruCache<K, V> {

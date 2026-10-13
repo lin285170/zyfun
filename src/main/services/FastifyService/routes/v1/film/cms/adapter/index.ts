@@ -7,6 +7,7 @@ import T3DrpyAdapter from './t3Drpy';
 import T3PyAdapter from './t3Py';
 import T3XbpqAdapter from './t3Xbpq';
 import T3XyqAdapter from './t3Xyq';
+import T3PanAdapter from './t3Pan';
 import T4CatvodAdapter from './t4Catvod';
 import T4DrpyJs0Adapter from './t4DrpyJs0';
 import T4DrpysAdapter from './t4Drpys';
@@ -21,6 +22,7 @@ export {
   T3PyAdapter,
   T3XbpqAdapter,
   T3XyqAdapter,
+  T3PanAdapter,
   T4CatvodAdapter,
   T4DrpyJs0Adapter,
   T4DrpysAdapter,
