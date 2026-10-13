@@ -26,6 +26,8 @@
  *
  * 凭据：Cookie 需含 `BDUSS`（web 端登录态）。
  */
+import { createHash } from 'node:crypto';
+
 import {
   PAN_DRIVER_ID,
   type IPanContext,
@@ -36,8 +38,17 @@ import {
 } from '../types';
 
 const HOST = 'https://pan.baidu.com';
+const PCS_HOST = 'https://pcs.baidu.com';
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+/** PCS locatedownload 需要网盘客户端 UA */
+const PCS_UA = 'netdisk;P2SP;2.2.60.26';
+
+/**
+ * PCS 定位下载签名的固定盐值（32 字节 ASCII）。
+ * 来源：BaiduPCS-Go `netdisksign/locatedownloadsign.go` 中逐字节写入的常量。
+ */
+const PCS_SIGN_SALT = 'ebrcUYiuxaZv2XGu7KIYKxUrqfnOfpDF';
 
 const LINK_RE = /https?:\/\/pan\.baidu\.com\/s\/([0-9a-zA-Z_-]+)/i;
 
@@ -54,7 +65,10 @@ interface IInitLocals {
   bdstoken: string;
   csrf: string;
   shareid: string | number;
+  /** 分享者的 uid */
   share_uk: string | number;
+  /** **当前登录用户**的 uid —— PCS 签名需要这个，不是 share_uk */
+  uk: string | number;
   loginstate: number;
 }
 
@@ -69,6 +83,8 @@ class BaiduDriver implements IPanDriver {
     surlShort: string;
     shareid: string;
     uk: string;
+    /** 当前登录用户 uid（PCS 签名用），来自 /share/init 的 uk */
+    uid: string;
     randsk: string;
     bdstoken: string;
   } | null = null;
@@ -147,6 +163,7 @@ class BaiduDriver implements IPanDriver {
       csrf: String(locals.csrf ?? ''),
       shareid: locals.shareid ?? '',
       share_uk: locals.share_uk ?? '',
+      uk: locals.uk ?? '',
       loginstate: Number(locals.loginstate ?? 0),
     };
   }
@@ -245,6 +262,7 @@ class BaiduDriver implements IPanDriver {
       surlShort,
       shareid: String(locals.shareid),
       uk: String(locals.share_uk),
+      uid: String(locals.uk),
       randsk: '',
       bdstoken: locals.bdstoken,
     };
@@ -268,8 +286,17 @@ class BaiduDriver implements IPanDriver {
     return { title, files, shareUrl: link, driver: this.id };
   }
 
-  /** ④ 转存到本人网盘，返回新 fs_id */
-  private async transfer(fsId: string, ctx: IPanContext, toPath = '/'): Promise<string> {
+  /**
+   * ④ 转存到本人网盘，返回**本人网盘侧的新 fs_id 与其绝对路径**。
+   *
+   * 路径是 PCS 取直链的必要参数（PCS 按 path 定位文件，而非 fs_id）。
+   * 实测转存响应里 `extra.list[0]` 同时给出 `to_fs_id` 与 `to`（新路径）。
+   */
+  private async transfer(
+    fsId: string,
+    ctx: IPanContext,
+    toPath = '/',
+  ): Promise<{ fsId: string; path: string }> {
     if (!this.session) throw new Error('缺少分享会话（请先 resolve）');
     const { surlShort, shareid, uk, randsk, bdstoken } = this.session;
     const res = await ctx.request({
@@ -284,44 +311,88 @@ class BaiduDriver implements IPanDriver {
       if (d.errno === 200025) throw new Error('百度转存失败：提取码未生效（BDCLND 缺失或失效）');
       throw new Error(`百度转存失败：errno=${d.errno} msg=${d.show_msg ?? ''}`);
     }
-    const toFsId = d.extra?.list?.[0]?.to_fs_id;
-    return toFsId ? String(toFsId) : fsId;
+    const item = d.extra?.list?.[0] ?? {};
+    const newFsId = item.to_fs_id ? String(item.to_fs_id) : fsId;
+    const newPath = String(item.to ?? '');
+    return { fsId: newFsId, path: newPath };
   }
 
-  /** ⑤ 取 dlink */
-  private async getDlink(fsId: string, ctx: IPanContext): Promise<string> {
-    const bdstoken = this.session?.bdstoken ?? '';
+  /**
+   * PCS 定位下载签名。
+   *
+   * 算法来源：BaiduPCS-Go 开源实现（`baidupcs/netdisksign/locatedownloadsign.go` + `devuid.go`），
+   * 已用真实账号实测通过（2026-10-13）。
+   *
+   *   devuid = UPPER( hex(MD5(bduss)) + "|0" )
+   *   rand   = hex( SHA1( hex(SHA1(bduss)) + uid + CONST + time + devuid ) )
+   *
+   * 其中 CONST 是 PCS 的固定盐值（32 字节，见 PCS_SIGN_SALT）。
+   */
+  private pcsSign(bduss: string, uid: string, timeSec = Math.floor(Date.now() / 1000)) {
+    const md5 = (s: string) => createHash('md5').update(s).digest('hex');
+    const sha1 = (s: string) => createHash('sha1').update(s).digest('hex');
+    const devuid = `${md5(bduss)}|0`.toUpperCase();
+    const rand = sha1(sha1(bduss) + uid + PCS_SIGN_SALT + String(timeSec) + devuid);
+    return { time: timeSec, rand, devuid };
+  }
+
+  /**
+   * ⑤ 取直链 —— 走 **PCS locatedownload**（而非需 access_token 的 `api/filemetas`）。
+   *
+   * 实测结论（2026-10-13）：FongMi 抓包走的就是 `pcs.baidu.com`；
+   * 请求 `method=locatedownload` + `time/rand/devuid/cuid` 四参数签名，
+   * 用 BDUSS Cookie 鉴权，**完全不需要 OAuth access_token**。
+   *
+   * @param path 本人网盘内的**绝对路径**（转存响应里的 `to` 字段）
+   */
+  private async getPcsDlink(path: string, ctx: IPanContext): Promise<string> {
+    const cookie = ctx.credential?.cookie ?? '';
+    const bduss = cookie.match(/BDUSS=([^;]+)/)?.[1] ?? '';
+    if (!bduss) throw new Error('百度 PCS 取直链需要 Cookie 中的 BDUSS');
+    const uid = this.session?.uid ?? '';
+    if (!uid) throw new Error('缺少 uid（请先调用 resolve 解析分享链接）');
+
+    const s = this.pcsSign(bduss, uid);
     const qs = new URLSearchParams({
-      target: JSON.stringify([Number(fsId)]),
-      dlink: '1',
-      web: '1',
-      channel: 'chunlei',
+      ant: '1',
+      check_blue: '1',
+      es: '1',
+      esl: '1',
       app_id: '250528',
-      clienttype: '0',
+      method: 'locatedownload',
+      path,
+      ver: '4.0',
+      clienttype: '17',
+      channel: '0',
+      apn_id: '1_0',
+      freeisp: '0',
+      queryfree: '0',
+      use: '0',
+      time: String(s.time),
+      rand: s.rand,
+      devuid: s.devuid,
+      cuid: s.devuid,
     });
-    if (bdstoken) qs.set('bdstoken', bdstoken);
+
     const res = await ctx.request({
-      url: `${HOST}/api/filemetas?${qs.toString()}`,
-      method: 'GET',
-      headers: this.headers(ctx),
+      url: `${PCS_HOST}/rest/2.0/pcs/file?${qs.toString()}`,
+      method: 'POST',
+      headers: this.headers(ctx, {
+        'User-Agent': PCS_UA,
+        Referer: `${HOST}/`,
+      }),
       responseType: 'json',
     });
-    const info = (res.data?.info ?? [])[0] ?? {};
-    if (!info.dlink) {
-      if (info.errno === 31021) {
-        // 实测（2026-10-13，模拟器内、家庭宽带 IP、5 种 app_id、目录与实际文件均试过）：
-        // 这是**百度 API 级硬限制**，Cookie 体系无法绕过 —— web 端取直链已被百度关闭。
-        // 前 4 步（init/verify/list/transfer）全部可用，仅差 OAuth access_token。
-        throw new Error(
-          '百度直链需要 OAuth access_token（API 返回 31021）。' +
-            'Cookie（BDUSS）与 access_token 属两套体系（pan.baidu.com vs openapi.baidu.com），' +
-            '实测无法互相转换。解法：注册百度开放平台应用获取 client_id 后走 OAuth 授权。' +
-            '在此之前，可让用户在转存后用百度网盘官方客户端播放。',
-        );
-      }
-      throw new Error(`百度未返回直链（info.errno=${info.errno ?? '?'}）`);
+    const d = res.data ?? {};
+    // PCS 成功时返回 { urls: [{ url }] }；失败时返回 { error_code, error_msg }
+    const raw = d.urls?.[0]?.url;
+    if (!raw) {
+      if (d.error_code === 31066) throw new Error('百度 PCS：文件不存在（path 不正确）');
+      if (d.error_code === 31074) throw new Error('百度 PCS：目录不可下载（请传具体文件路径）');
+      throw new Error(`百度 PCS 取直链失败：code=${d.error_code ?? '?'} msg=${d.error_msg ?? ''}`);
     }
-    return info.dlink as string;
+    // 响应里的 & 会被转义成 \u0026，需还原
+    return String(raw).replace(/\\u0026/g, '&');
   }
 
   async play(
@@ -334,8 +405,11 @@ class BaiduDriver implements IPanDriver {
     }
     if (!this.session) throw new Error('缺少分享会话（请先调用 resolve 解析分享链接）');
 
-    const newFsId = await this.transfer(fileId, ctx);
-    const dlink = await this.getDlink(newFsId, ctx);
+    // ④ 转存到本人网盘 → 拿到**本人网盘内的绝对路径**（PCS 按 path 定位）
+    const { path } = await this.transfer(fileId, ctx);
+    if (!path) throw new Error('百度转存未返回文件路径，无法走 PCS 取直链');
+    // ⑤ 走 PCS locatedownload 取直链（无需 access_token）
+    const dlink = await this.getPcsDlink(path, ctx);
     const hdrs = this.withRandsk(ctx, this.session.randsk);
     return {
       url: dlink,
