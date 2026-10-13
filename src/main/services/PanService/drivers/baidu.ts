@@ -309,9 +309,14 @@ class BaiduDriver implements IPanDriver {
     const info = (res.data?.info ?? [])[0] ?? {};
     if (!info.dlink) {
       if (info.errno === 31021) {
+        // 实测（2026-10-13，模拟器内、家庭宽带 IP、5 种 app_id、目录与实际文件均试过）：
+        // 这是**百度 API 级硬限制**，Cookie 体系无法绕过 —— web 端取直链已被百度关闭。
+        // 前 4 步（init/verify/list/transfer）全部可用，仅差 OAuth access_token。
         throw new Error(
-          '百度直链获取失败：接口要求 access_token（errno=31021）。' +
-            '前 4 步（init/verify/list/transfer）均已通过，仅差 OAuth 换 token 这一步。',
+          '百度直链需要 OAuth access_token（API 返回 31021）。' +
+            'Cookie（BDUSS）与 access_token 属两套体系（pan.baidu.com vs openapi.baidu.com），' +
+            '实测无法互相转换。解法：注册百度开放平台应用获取 client_id 后走 OAuth 授权。' +
+            '在此之前，可让用户在转存后用百度网盘官方客户端播放。',
         );
       }
       throw new Error(`百度未返回直链（info.errno=${info.errno ?? '?'}）`);
