@@ -15,13 +15,12 @@
  * 与 FongMi 的对应关系：FongMi 由 libwexproxy.so 在本地做网盘解析与代理；
  * 本适配器把同等能力放进 zyfun 主进程，并通过 /api/v1/pan/proxy 输出。
  */
-import type { ICmsParams, ICmsResultPromise, IConstructorOptions } from '@shared/types/cms';
-import { ORIGIN } from '@shared/config/env';
-import JSON5 from 'json5';
-
 import { panService } from '@main/services/PanService';
 import { toProxyUrl } from '@main/services/PanService/proxy';
 import type { IPanFile, IPanShareResult } from '@main/services/PanService/types';
+import { PREFIX_API } from '@shared/config/env';
+import type { ICmsParams, ICmsResultPromise, IConstructorOptions } from '@shared/types/cms';
+import JSON5 from 'json5';
 
 interface IPanSource {
   name?: string;
@@ -146,7 +145,7 @@ class T3PanAdapter {
           vod_pic: '',
           vod_remarks: `${files.length} 个文件`,
           vod_blurb: `来源：${share.driver}`,
-          vod_content: `来源：${share.driver}　文件数：${files.length}`,
+          vod_content: `来源：${share.driver} 文件数：${files.length}`,
           vod_play_from: this.source.name || share.driver,
           vod_play_url: episodes,
         },
@@ -174,7 +173,7 @@ class T3PanAdapter {
     });
 
     // 经令牌代理输出，避免把网盘 Cookie 暴露到播放地址
-    const url = toProxyUrl(ORIGIN || 'http://127.0.0.1', info);
+    const url = toProxyUrl(PREFIX_API || 'http://127.0.0.1:9978/api', info);
     return { url, parse: 0 };
   }
 

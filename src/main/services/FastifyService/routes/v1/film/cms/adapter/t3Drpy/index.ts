@@ -8,6 +8,15 @@ import type { ICmsMethodName, ICmsParams, ICmsResultPromise, IConstructorOptions
 import type { Pool } from 'workerpool';
 import workerpool from 'workerpool';
 
+import {
+  encodePanPlayId,
+  extractPanShareUrl,
+  isPanPlayId,
+  isPanShareUrl,
+  listPanMedia,
+  resolvePanPlay,
+} from '../panPlay';
+
 type ICmsResultCustom = Omit<Awaited<ICmsResultPromise>, 'play'> & {
   play: Awaited<ICmsResultPromise['play']> & {
     parse_extra?: string;
@@ -148,8 +157,10 @@ class T3DrpyAdapter {
 
     const idsArray = [ids];
     const rawList = Array.isArray(resp?.list) ? resp.list : [];
-    const videos = rawList
-      .map((v, i) => ({
+    const videos: any[] = [];
+    for (let i = 0; i < rawList.length; i++) {
+      const v = rawList[i];
+      const item = {
         vod_id: String((v.vod_id || idsArray[i]) ?? ''),
         vod_name: v.vod_name ?? '',
         vod_pic: v.vod_pic ?? '',
@@ -167,14 +178,74 @@ class T3DrpyAdapter {
         vod_play_from: v.vod_play_from ?? '',
         vod_play_url: v.vod_play_url ?? '',
         type_name: v.type_name ?? '',
-      }))
-      .filter((v) => v.vod_id);
+      };
+      if (!item.vod_id) continue;
+
+      // 网盘型源：把分享链接展开成「一个媒体文件 = 一集」，播放交给主进程解析
+      if (item.vod_play_url && item.vod_play_url.includes('$')) {
+        const expanded = await this.expandPanPlayUrl(item.vod_play_from, item.vod_play_url);
+        item.vod_play_url = expanded.url;
+        item.vod_play_from = expanded.from;
+      }
+
+      videos.push(item);
+    }
 
     const pagecurrent = Number(resp?.page) || 1;
     const pagecount = Number(resp?.pagecount) || (videos.length ? 1 : 0);
     const total = Number(resp?.total) || videos.length;
 
     return { page: pagecurrent, pagecount, total, list: videos };
+  }
+
+  /**
+   * 网盘型源支持：把二级列表里的网盘分享链接展开为「一个媒体文件 = 一集」。
+   *
+   * 展开后的集链接使用 `pan://<base64url(shareUrl)>|<fileId>` 形式，播放时由
+   * play() 交给 PanService 解析成可播放直链。展开失败时保留原始链接，
+   * 避免整条播放列表不可用。
+   */
+  private async expandPanPlayUrl(vodPlayFrom: string, vodPlayUrl: string): Promise<{ from: string; url: string }> {
+    const LINE_SEP = '$$$';
+    const lines = String(vodPlayUrl).split(LINE_SEP);
+    const newLines: string[] = [];
+
+    for (const line of lines) {
+      const episodes = line.split('#').filter(Boolean);
+      const newEpisodes: string[] = [];
+
+      for (const ep of episodes) {
+        const parts = ep.split('$');
+        const name = parts[0];
+        const link = parts.slice(1).join('$');
+        const shareUrl = link ? extractPanShareUrl(link) : '';
+
+        if (!shareUrl) {
+          newEpisodes.push(ep);
+          continue;
+        }
+
+        try {
+          const media = await listPanMedia(shareUrl);
+          if (!media.files.length) {
+            newEpisodes.push(ep);
+            continue;
+          }
+          const single = media.files.length === 1;
+          for (const f of media.files) {
+            const title = single ? name : f.name.replace(/\.[^.]+$/, '') || name;
+            newEpisodes.push(`${title}$${encodePanPlayId(shareUrl, f.fileId)}`);
+          }
+        } catch (error) {
+          logger.warn(`网盘展开失败：${shareUrl} - ${(error as Error)?.message}`);
+          newEpisodes.push(ep);
+        }
+      }
+
+      newLines.push(newEpisodes.join('#'));
+    }
+
+    return { from: vodPlayFrom, url: newLines.join(LINE_SEP) };
   }
 
   public async search(doc: ICmsParams['search']): ICmsResultPromise['search'] {
@@ -202,6 +273,21 @@ class T3DrpyAdapter {
 
   public async play(doc: ICmsParams['play']): ICmsResultPromise['play'] {
     const { flag, play } = doc || {};
+
+    // 网盘播放：`pan://` 标识或原始分享链接 → 交给 PanService 解析为代理直链
+    // （对应 FongMi 里由 libwexproxy.so 处理网盘的那一步）
+    if (play && (isPanPlayId(play) || isPanShareUrl(play))) {
+      try {
+        const url = await resolvePanPlay(play);
+        if (url) {
+          return { url, quality: [], parse: 0, jx: 0, headers: {}, script: {} };
+        }
+      } catch (error) {
+        logger.error(`网盘解析失败：${(error as Error)?.message}`);
+        throw new Error(`网盘解析失败：${(error as Error)?.message}`);
+      }
+    }
+
     const resp = await this.execCtx('play', { flag, play });
 
     const qs = resp?.parse_extra;
