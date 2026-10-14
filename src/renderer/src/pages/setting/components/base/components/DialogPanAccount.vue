@@ -29,6 +29,14 @@
             </div>
             <div class="pan-row-actions">
               <t-button
+                size="small"
+                theme="primary"
+                :loading="loadingBrowser === row.driver"
+                @click="onBrowserLogin(row.driver)"
+              >
+                浏览器登录
+              </t-button>
+              <t-button
                 v-if="supportsQr(row.driver)"
                 size="small"
                 theme="primary"
@@ -103,14 +111,17 @@ import { MessagePlugin } from 'tdesign-vue-next';
 import { computed, ref, watch } from 'vue';
 
 import {
+  cancelPanLogin,
   cancelPanQr,
   checkPanCredential,
   createPanQr,
   fetchPanCredentials,
   fetchPanDrivers,
+  pollPanLogin,
   pollPanQr,
   removePanCredential,
   savePanCredential,
+  startPanLogin,
 } from '@/api/pan';
 import { attachContent } from '@/config/global';
 
@@ -132,6 +143,7 @@ const editValue = ref<Record<string, string>>({});
 const saving = ref('');
 const checking = ref('');
 const loadingQr = ref('');
+const loadingBrowser = ref('');
 
 /** 支持扫码的驱动（与后端 qrlogin.supports 保持一致） */
 const supportsQr = (d: string) => d === 'baidu';
@@ -154,6 +166,7 @@ watch(formVisible, (v) => {
     qrVisible.value = false;
   } else {
     closeQr();
+    cancelLogin();
   }
 });
 
@@ -181,6 +194,72 @@ async function onSave(driver: string) {
   } finally {
     saving.value = '';
   }
+}
+
+/* ---------------- 浏览器登录 ---------------- */
+const loginId = ref('');
+let loginTimer: ReturnType<typeof setTimeout> | null = null;
+
+function stopLoginTimer() {
+  if (loginTimer) {
+    clearTimeout(loginTimer);
+    loginTimer = null;
+  }
+}
+
+function cancelLogin() {
+  stopLoginTimer();
+  if (loginId.value) cancelPanLogin(loginId.value).catch(() => {});
+  loginId.value = '';
+}
+
+async function onBrowserLogin(driver: string) {
+  loadingBrowser.value = driver;
+  try {
+    cancelLogin();
+    const res: any = await startPanLogin(driver);
+    const id = res?.loginId;
+    if (!id) {
+      MessagePlugin.warning('无法打开登录窗口');
+      return;
+    }
+    loginId.value = id;
+    MessagePlugin.info('请在打开的窗口中完成登录，成功后会自动保存');
+    loopLoginPoll();
+  } catch (e) {
+    MessagePlugin.error(`打开登录窗口失败：${String(e)}`);
+  } finally {
+    loadingBrowser.value = '';
+  }
+}
+
+function loopLoginPoll() {
+  if (!loginId.value) return;
+  stopLoginTimer();
+  loginTimer = setTimeout(async () => {
+    const id = loginId.value;
+    if (!id) return;
+    try {
+      const res: any = await pollPanLogin(id);
+      const status = res?.status;
+      if (status === 'success') {
+        MessagePlugin.success('登录成功，凭据已保存');
+        loginId.value = '';
+        await load();
+        return;
+      }
+      if (status === 'expired' || status === 'failed') {
+        MessagePlugin.warning(res?.message || '登录未完成');
+        loginId.value = '';
+        await load();
+        return;
+      }
+      loopLoginPoll();
+    } catch {
+      // 单次轮询失败不终止
+      loopLoginPoll();
+    }
+  }, 1500);
 }
 
 async function onCheck(driver: string) {

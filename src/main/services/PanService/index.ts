@@ -13,8 +13,8 @@
 import { loggerService } from '@main/services/LoggerService';
 import { LOG_MODULE } from '@shared/config/logger';
 
-import quark from './drivers/quark';
 import baidu from './drivers/baidu';
+import quark from './drivers/quark';
 import { panStore } from './store';
 import type { IPanContext, IPanDriver, IPanDriverId } from './types';
 
@@ -101,6 +101,7 @@ export class PanService {
 
 export const panService = new PanService();
 export { panStore };
-export { qrLoginService } from './qrlogin';
+export { panLoginWindowService } from './loginWindow';
 export { panProxy, toProxyUrl } from './proxy';
+export { qrLoginService } from './qrlogin';
 export * from './types';

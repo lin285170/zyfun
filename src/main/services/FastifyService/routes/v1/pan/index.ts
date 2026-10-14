@@ -13,7 +13,7 @@
  */
 import { Buffer } from 'node:buffer';
 
-import { panProxy, panService, panStore, qrLoginService } from '@main/services/PanService';
+import { panLoginWindowService, panProxy, panService, panStore, qrLoginService } from '@main/services/PanService';
 import type { IPanDriverId } from '@main/services/PanService/types';
 import { request } from '@main/utils/request';
 import type { FastifyPluginAsync } from 'fastify';
@@ -136,6 +136,35 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
     if (qrId) qrLoginService.cancel(qrId);
     return { code: 0, data: true };
   });
+
+  /**
+   * 浏览器登录：打开独立窗口让用户在真实页面登录，自动抓取并保存 Cookie。
+   * 夸克 / 百度通用，不依赖各平台不公开的扫码协议。
+   */
+  fastify.post<{ Body: { driver?: string } }>(`/${API_PREFIX}/login/start`, async (req) => {
+    const driver = req.body?.driver;
+    if (!driver) return { code: -1, msg: 'driver is required' };
+    if (!panLoginWindowService.supports(driver)) return { code: -1, msg: `${driver} 暂不支持浏览器登录` };
+    const loginId = panLoginWindowService.start(driver);
+    return { code: 0, data: { loginId } };
+  });
+
+  /** 轮询浏览器登录状态 */
+  fastify.get<{ Querystring: { loginId?: string } }>(`/${API_PREFIX}/login/poll`, async (req) => {
+    const loginId = req.query?.loginId;
+    if (!loginId) return { code: -1, msg: 'loginId is required' };
+    return { code: 0, data: panLoginWindowService.poll(loginId) };
+  });
+
+  /** 取消浏览器登录（关闭窗口） */
+  fastify.delete<{ Querystring: { loginId?: string }; Body: { loginId?: string } }>(
+    `/${API_PREFIX}/login`,
+    async (req) => {
+      const loginId = req.query?.loginId ?? req.body?.loginId;
+      if (loginId) panLoginWindowService.cancel(loginId);
+      return { code: 0, data: true };
+    },
+  );
 };
 
 export default api;

@@ -72,3 +72,18 @@ export function pollPanQr(qrId: string, save = true) {
 export function cancelPanQr(qrId: string) {
   return request.request({ url: `/v1/pan/qr?qrId=${encodeURIComponent(qrId)}`, method: 'delete' });
 }
+
+/** 浏览器登录：打开独立窗口让用户在真实页面登录，自动抓取 Cookie */
+export function startPanLogin(driver: string) {
+  return request.request({ url: '/v1/pan/login/start', method: 'post', data: { driver } });
+}
+
+/** 轮询浏览器登录状态 */
+export function pollPanLogin(loginId: string) {
+  return request.request({ url: `/v1/pan/login/poll?loginId=${encodeURIComponent(loginId)}`, method: 'get' });
+}
+
+/** 取消浏览器登录（关闭窗口） */
+export function cancelPanLogin(loginId: string) {
+  return request.request({ url: `/v1/pan/login?loginId=${encodeURIComponent(loginId)}`, method: 'delete' });
+}
