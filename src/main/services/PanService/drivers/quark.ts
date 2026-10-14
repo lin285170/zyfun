@@ -16,8 +16,16 @@ import { PAN_DRIVER_ID } from '../types';
 
 const API = 'https://drive-pc.quark.cn/1/clouddrive';
 const REFERER = 'https://pan.quark.cn/';
+/**
+ * 必须使用「夸克 PC 客户端」UA。
+ *
+ * 夸克按 UA 判定客户端类型：浏览器 UA 请求 `/file/download` 时，对大文件会直接
+ * 返回 HTTP 400 + `23018 download file size limit`（实测 209MB 即被拒，而本站资源
+ * 普遍 800MB~2GB）；换成 PC 客户端 UA 后同一文件立刻返回 code=0 与直链。
+ * 这也是 FongMi 等客户端能播同一账号大文件的原因（其 wex 代理同样伪装 PC 客户端）。
+ */
 const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/110.0.5481.181 Electron/23.1.7 Safari/537.36';
 
 /** 常见分享域名 */
 const LINK_RES = [
