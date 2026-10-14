@@ -11,9 +11,11 @@
  * GET  /api/v1/pan/qr/poll?qrId=     轮询扫码状态（确认后回传凭据）
  * DEL  /api/v1/pan/qr?qrId=          取消扫码会话
  */
-import { request } from '@main/utils/request';
+import { Buffer } from 'node:buffer';
+
 import { panProxy, panService, panStore, qrLoginService } from '@main/services/PanService';
 import type { IPanDriverId } from '@main/services/PanService/types';
+import { request } from '@main/utils/request';
 import type { FastifyPluginAsync } from 'fastify';
 
 const API_PREFIX = 'pan';
@@ -32,8 +34,8 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
     try {
       const headers: Record<string, string> = { ...(entry.headers ?? {}) };
       // 透传 Range，保证拖动可用
-      const range = req.headers['range'];
-      if (range) headers['Range'] = String(range);
+      const range = req.headers.range;
+      if (range) headers.Range = String(range);
 
       const res = await request.request({
         url: entry.url,
@@ -70,23 +72,25 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
   });
 
   /** 保存凭据 */
-  fastify.post<{ Body: { driver: IPanDriverId; cookie?: string; token?: string; refreshToken?: string; enabled?: boolean } }>(
+  fastify.post<{
+    Body: { driver: IPanDriverId; cookie?: string; token?: string; refreshToken?: string; enabled?: boolean };
+  }>(`/${API_PREFIX}/credentials`, async (req) => {
+    const { driver, ...rest } = req.body ?? ({} as any);
+    if (!driver) return { code: -1, msg: 'driver is required' };
+    await panStore.set(driver, rest);
+    return { code: 0, data: true };
+  });
+
+  /** 删除凭据（driver 支持 query 或 body 传入） */
+  fastify.delete<{ Querystring: { driver?: string }; Body: { driver?: string } }>(
     `/${API_PREFIX}/credentials`,
     async (req) => {
-      const { driver, ...rest } = req.body ?? ({} as any);
+      const driver = req.query?.driver ?? req.body?.driver;
       if (!driver) return { code: -1, msg: 'driver is required' };
-      await panStore.set(driver, rest);
+      await panStore.remove(driver as IPanDriverId);
       return { code: 0, data: true };
     },
   );
-
-  /** 删除凭据 */
-  fastify.delete<{ Querystring: { driver?: string } }>(`/${API_PREFIX}/credentials`, async (req) => {
-    const driver = req.query?.driver;
-    if (!driver) return { code: -1, msg: 'driver is required' };
-    await panStore.remove(driver as IPanDriverId);
-    return { code: 0, data: true };
-  });
 
   /** 凭据自检 */
   fastify.post<{ Body: { driver: IPanDriverId } }>(`/${API_PREFIX}/check`, async (req) => {
@@ -108,30 +112,27 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
   });
 
   /** 轮询扫码状态；确认登录后回传凭据（调用方落库） */
-  fastify.get<{ Querystring: { qrId?: string; save?: string } }>(
-    `/${API_PREFIX}/qr/poll`,
-    async (req) => {
-      const qrId = req.query?.qrId;
-      if (!qrId) return { code: -1, msg: 'qrId is required' };
-      const ctx = await panService.context('baidu');
-      const res = await qrLoginService.poll(qrId, ctx);
-      // 默认自动落库，便于前端一步到位；传 save=0 可只取不存
-      if (res.status === 'confirmed' && res.credential && req.query?.save !== '0') {
-        await panStore.set(res.credential.driver, {
-          driver: res.credential.driver,
-          cookie: res.credential.cookie,
-          enabled: true,
-        });
-        const ok = await panService.check(res.credential.driver).catch(() => false);
-        return { code: 0, data: { ...res, saved: true, ok } };
-      }
-      return { code: 0, data: res };
-    },
-  );
-
-  /** 取消扫码会话 */
-  fastify.delete<{ Querystring: { qrId?: string } }>(`/${API_PREFIX}/qr`, async (req) => {
+  fastify.get<{ Querystring: { qrId?: string; save?: string } }>(`/${API_PREFIX}/qr/poll`, async (req) => {
     const qrId = req.query?.qrId;
+    if (!qrId) return { code: -1, msg: 'qrId is required' };
+    const ctx = await panService.context('baidu');
+    const res = await qrLoginService.poll(qrId, ctx);
+    // 默认自动落库，便于前端一步到位；传 save=0 可只取不存
+    if (res.status === 'confirmed' && res.credential && req.query?.save !== '0') {
+      await panStore.set(res.credential.driver, {
+        driver: res.credential.driver,
+        cookie: res.credential.cookie,
+        enabled: true,
+      });
+      const ok = await panService.check(res.credential.driver).catch(() => false);
+      return { code: 0, data: { ...res, saved: true, ok } };
+    }
+    return { code: 0, data: res };
+  });
+
+  /** 取消扫码会话（qrId 支持 query 或 body 传入） */
+  fastify.delete<{ Querystring: { qrId?: string }; Body: { qrId?: string } }>(`/${API_PREFIX}/qr`, async (req) => {
+    const qrId = req.query?.qrId ?? req.body?.qrId;
     if (qrId) qrLoginService.cancel(qrId);
     return { code: 0, data: true };
   });

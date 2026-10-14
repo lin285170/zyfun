@@ -48,9 +48,9 @@ export function savePanCredential(doc: { driver: string; cookie?: string; token?
   return request.request({ url: '/v1/pan/credentials', method: 'post', data: doc });
 }
 
-/** 删除凭据 */
+/** 删除凭据（参数必须走 query：请求层会把非 GET 的 params 搬进 body） */
 export function removePanCredential(driver: string) {
-  return request.request({ url: '/v1/pan/credentials', method: 'delete', params: { driver } });
+  return request.request({ url: `/v1/pan/credentials?driver=${encodeURIComponent(driver)}`, method: 'delete' });
 }
 
 /** 凭据自检（注意是 POST） */
@@ -68,7 +68,7 @@ export function pollPanQr(qrId: string, save = true) {
   return request.request({ url: '/v1/pan/qr/poll', method: 'get', params: { qrId, save: save ? '1' : '0' } });
 }
 
-/** 取消扫码会话 */
+/** 取消扫码会话（同上，参数走 query） */
 export function cancelPanQr(qrId: string) {
-  return request.request({ url: '/v1/pan/qr', method: 'delete', params: { qrId } });
+  return request.request({ url: `/v1/pan/qr?qrId=${encodeURIComponent(qrId)}`, method: 'delete' });
 }
