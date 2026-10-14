@@ -28,14 +28,18 @@
  */
 import { createHash } from 'node:crypto';
 
-import {
-  PAN_DRIVER_ID,
-  type IPanContext,
-  type IPanDriver,
-  type IPanFile,
-  type IPanPlayInfo,
-  type IPanShareResult,
-} from '../types';
+import { baiduBrowserService } from '../baiduBrowser';
+import type { IPanContext, IPanDriver, IPanFile, IPanPlayInfo, IPanShareResult } from '../types';
+import { PAN_DRIVER_ID } from '../types';
+
+/**
+ * 需要「浏览器过验」的专用信号。
+ *
+ * 带提取码的分享在新版百度上必须经浏览器完成校验（pwd_enc + 指纹），
+ * 纯 HTTP 无法复现；resolve 抛出该信号后，由上层打开分享页窗口取得 BDCLND，
+ * 随后重试即可走通「API 转存 → PCS 直链」。
+ */
+export const BAIDU_NEED_VERIFY = 'BAIDU_NEED_VERIFY';
 
 const HOST = 'https://pan.baidu.com';
 const PCS_HOST = 'https://pcs.baidu.com';
@@ -50,7 +54,7 @@ const PCS_UA = 'netdisk;P2SP;2.2.60.26';
  */
 const PCS_SIGN_SALT = 'ebrcUYiuxaZv2XGu7KIYKxUrqfnOfpDF';
 
-const LINK_RE = /https?:\/\/pan\.baidu\.com\/s\/([0-9a-zA-Z_-]+)/i;
+const LINK_RE = /https?:\/\/pan\.baidu\.com\/s\/[\w-]+/i;
 
 interface IBaiduListItem {
   fs_id: number;
@@ -99,12 +103,12 @@ class BaiduDriver implements IPanDriver {
    * - `surlShort` 用于 `share/init|verify|list|transfer`（去前导 1）
    */
   private parse(link: string): { surlFull: string; surlShort: string; pwd: string } {
-    const m = link.match(/\/s\/([0-9a-zA-Z_-]+)/i);
+    const m = link.match(/\/s\/([\w-]+)/i);
     if (!m) throw new Error('无法从链接中解析百度网盘 surl');
     const surlFull = m[1];
     // 实测：/share/init 等接口使用去掉前导 1 的形式（百度自身 302 也这么跳）
     const surlShort = surlFull.startsWith('1') ? surlFull.slice(1) : surlFull;
-    const p = link.match(/[?&]pwd=([0-9a-zA-Z]{4})/i);
+    const p = link.match(/[?&]pwd=([0-9a-z]{4})/i);
     return { surlFull, surlShort, pwd: p ? p[1] : '' };
   }
 
@@ -125,9 +129,7 @@ class BaiduDriver implements IPanDriver {
     const base = ctx.credential?.cookie ?? '';
     let cookie = base;
     if (randsk) {
-      cookie = /BDCLND=/.test(base)
-        ? base.replace(/BDCLND=[^;]*/g, `BDCLND=${randsk}`)
-        : `${base}; BDCLND=${randsk}`;
+      cookie = /BDCLND=/.test(base) ? base.replace(/BDCLND=[^;]*/g, `BDCLND=${randsk}`) : `${base}; BDCLND=${randsk}`;
     }
     return this.headers(ctx, { Cookie: cookie, ...(referer ? { Referer: referer } : {}) });
   }
@@ -145,27 +147,59 @@ class BaiduDriver implements IPanDriver {
       responseType: 'text',
     });
     const html = typeof res.data === 'string' ? res.data : String(res.data ?? '');
-    const m = html.match(/window\.locals\s*=\s*(\{[\s\S]*?\});/);
-    if (!m) {
-      throw new Error('百度 /share/init 未返回 window.locals（可能链接失效或需登录）');
+
+    // 兼容 ①：老版页面内联 window.locals
+    const mLocals = html.match(/window\.locals\s*=\s*(\{[\s\S]*?\});/);
+    if (mLocals) {
+      try {
+        const locals = JSON.parse(mLocals[1]);
+        if (locals.bdstoken) {
+          return {
+            bdstoken: String(locals.bdstoken),
+            csrf: String(locals.csrf ?? ''),
+            shareid: locals.shareid ?? '',
+            share_uk: locals.share_uk ?? '',
+            uk: locals.uk ?? '',
+            loginstate: Number(locals.loginstate ?? 0),
+          };
+        }
+      } catch {
+        /* 落到兼容 ② */
+      }
     }
-    let locals: any;
-    try {
-      locals = JSON.parse(m[1]);
-    } catch {
-      throw new Error('百度 /share/init 的 window.locals 解析失败');
-    }
-    if (!locals.bdstoken) {
+
+    // 兼容 ②（2026-10 实测）：新版不再内联 window.locals，但 HTML 中仍带裸字段
+    const bdstoken = html.match(/["']?bdstoken["']?\s*[:=]\s*["']([0-9a-f]{16,})["']/i)?.[1] ?? '';
+    if (!bdstoken) {
       throw new Error('百度 /share/init 未取到 bdstoken（Cookie 可能已失效，需含 BDUSS）');
     }
-    return {
-      bdstoken: String(locals.bdstoken),
-      csrf: String(locals.csrf ?? ''),
-      shareid: locals.shareid ?? '',
-      share_uk: locals.share_uk ?? '',
-      uk: locals.uk ?? '',
-      loginstate: Number(locals.loginstate ?? 0),
+    const pickNum = (key: string): string => {
+      const m = html.match(new RegExp(`["']?${key}["']?\\s*[:=]\\s*["']?([0-9]+)["']?`));
+      return m?.[1] ?? '';
     };
+    return {
+      bdstoken,
+      csrf: '',
+      shareid: pickNum('shareid'),
+      share_uk: pickNum('share_uk'),
+      uk: pickNum('uk'),
+      loginstate: 1,
+    };
+  }
+
+  /** 取当前登录用户的 uid（PCS 定位下载签名需要，非分享者 uk） */
+  private async myUid(ctx: IPanContext): Promise<string> {
+    try {
+      const res = await ctx.request({
+        url: `${HOST}/rest/2.0/xpan/nas?method=uinfo&channel=chunlei&web=1&app_id=250528&clienttype=0`,
+        method: 'GET',
+        headers: this.headers(ctx),
+        responseType: 'json',
+      });
+      return String((res.data ?? {}).uk ?? '');
+    } catch {
+      return '';
+    }
   }
 
   /** 取 shareid / uk（免 Cookie，需完整 surl） */
@@ -198,8 +232,7 @@ class BaiduDriver implements IPanDriver {
     const d = res.data ?? {};
     if (d.errno !== 0) {
       throw new Error(
-        `百度提取码校验失败：errno=${d.errno}` +
-          (d.errno === 105 ? '（通常因缺少 bdstoken，或提取码错误）' : ''),
+        `百度提取码校验失败：errno=${d.errno}${d.errno === 105 ? '（通常因缺少 bdstoken，或提取码错误）' : ''}`,
       );
     }
     // ⚠️ 必须 trim：接口返回的 randsk 前后可能带空白，直接写入 Cookie 会失效
@@ -255,29 +288,59 @@ class BaiduDriver implements IPanDriver {
   async resolve(link: string, ctx: IPanContext): Promise<IPanShareResult> {
     const { surlFull, surlShort, pwd } = this.parse(link);
 
-    // ① 优先用 /share/init 拿 bdstoken（同时能拿到 shareid/uk）
+    // ① bdstoken（/share/init，兼容老/新两种页面结构）
     const locals = await this.initShare(surlShort, pwd, ctx);
+
+    // ② shareid / uk：shorturlinfo 实测更稳定，失败再退回页面字段
+    let shareid = '';
+    let shareUk = '';
+    try {
+      const info = await this.shortUrlInfo(surlFull, ctx);
+      shareid = info.shareid;
+      shareUk = info.uk;
+    } catch {
+      /* 落到页面字段 */
+    }
+    if (!shareid) {
+      shareid = String(locals.shareid);
+      shareUk = String(locals.share_uk || locals.shareid);
+    }
+
+    // ③ 当前登录用户 uid（PCS 定位下载签名需要它，不是分享者 uk）
+    const uid = (await this.myUid(ctx)) || String(locals.uk);
+
     this.session = {
       surlFull,
       surlShort,
-      shareid: String(locals.shareid),
-      uk: String(locals.share_uk),
-      uid: String(locals.uk),
+      shareid,
+      uk: shareUk,
+      uid,
       randsk: '',
       bdstoken: locals.bdstoken,
     };
 
-    // ② 提取码校验
-    let randsk = '';
-    if (pwd) {
-      randsk = await this.verify(surlShort, pwd, locals.bdstoken, ctx);
-    } else {
+    // ④ 提取码凭据 randsk
+    //    优先用「浏览器过验」缓存下来的 BDCLND：新版 verify 需要 pwd_enc 混淆 +
+    //    时间戳签名 + 客户端指纹（实测纯 HTTP 恒返 9019），浏览器页可自然完成校验。
+    let randsk = baiduBrowserService.getCachedRandsk(link);
+    if (!randsk && !pwd) {
       try {
         const info = await this.shortUrlInfo(surlFull, ctx);
-        randsk = info.randsk.trim();
+        randsk = String(info.randsk ?? '').trim();
       } catch {
-        /* 忽略：无提取码时 shorturlinfo 可能失败，不影响后续 */
+        /* 无提取码分享也可能拿不到，忽略 */
       }
+    }
+    if (!randsk && pwd) {
+      // 仍尝试一次 API 校验（部分老分享仍可用）
+      try {
+        randsk = await this.verify(surlShort, pwd, locals.bdstoken, ctx);
+      } catch {
+        /* 需要浏览器过验 */
+      }
+    }
+    if (!randsk && pwd) {
+      throw new Error(BAIDU_NEED_VERIFY);
     }
     this.session.randsk = randsk;
 
@@ -292,11 +355,7 @@ class BaiduDriver implements IPanDriver {
    * 路径是 PCS 取直链的必要参数（PCS 按 path 定位文件，而非 fs_id）。
    * 实测转存响应里 `extra.list[0]` 同时给出 `to_fs_id` 与 `to`（新路径）。
    */
-  private async transfer(
-    fsId: string,
-    ctx: IPanContext,
-    toPath = '/',
-  ): Promise<{ fsId: string; path: string }> {
+  private async transfer(fsId: string, ctx: IPanContext, toPath = '/'): Promise<{ fsId: string; path: string }> {
     if (!this.session) throw new Error('缺少分享会话（请先 resolve）');
     const { surlShort, shareid, uk, randsk, bdstoken } = this.session;
     const res = await ctx.request({

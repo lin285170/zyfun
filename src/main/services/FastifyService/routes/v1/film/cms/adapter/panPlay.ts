@@ -12,7 +12,8 @@
  */
 import { Buffer } from 'node:buffer';
 
-import { panService } from '@main/services/PanService';
+import { baiduBrowserService, panService } from '@main/services/PanService';
+import { BAIDU_NEED_VERIFY } from '@main/services/PanService/drivers/baidu';
 import { toProxyUrl } from '@main/services/PanService/proxy';
 import type { IPanFile, IPanPlayInfo } from '@main/services/PanService/types';
 import { PREFIX_API } from '@shared/config/env';
@@ -87,7 +88,23 @@ export async function listPanMedia(shareUrl: string): Promise<IPanMediaList> {
 
 /** 把网盘文件解析为经令牌代理的可播放直链 */
 export async function panFileToProxyUrl(shareUrl: string, fileId?: string): Promise<string> {
-  const share = await panService.resolve(shareUrl);
+  let share;
+  try {
+    share = await panService.resolve(shareUrl);
+  } catch (error: any) {
+    // 百度带提取码的分享需要真实浏览器完成校验（pwd_enc + 指纹，纯 HTTP 无法复现）：
+    // 此处自动打开分享页窗口，校验通过后 BDCLND 会缓存下来，用户重新点播即可播放。
+    if (String(error?.message ?? '').includes(BAIDU_NEED_VERIFY)) {
+      const pwd = shareUrl.match(/[?&]pwd=([0-9a-z]{4})/i)?.[1] ?? '';
+      baiduBrowserService.start(shareUrl, pwd);
+      throw new Error(
+        '百度网盘需要先在浏览器中完成分享校验：已为你打开分享页窗口，页面会自动校验，' +
+          '窗口关闭后请重新点播本集即可播放（仅该分享首次需要）。',
+      );
+    }
+    throw error;
+  }
+
   const all = flattenPanFiles(share.files);
   if (!all.length) throw new Error('网盘分享内没有文件');
 

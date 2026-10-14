@@ -101,6 +101,7 @@ export class PanService {
 
 export const panService = new PanService();
 export { panStore };
+export { baiduBrowserService } from './baiduBrowser';
 export { panLoginWindowService } from './loginWindow';
 export { panProxy, toProxyUrl } from './proxy';
 export { qrLoginService } from './qrlogin';
