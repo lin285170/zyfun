@@ -15,6 +15,8 @@ on:
         options:
           - all
           - win
+          - win-x64
+          - win-arm64
           - mac
           - linux
   push:
@@ -65,6 +67,12 @@ jobs:
               {"os": "windows-11-arm", "platform": "win", "arch": "arm64", "build_command": "pnpm build:win:arm64"},
               {"os": "ubuntu-latest", "platform": "linux", "arch": "x64", "build_command": "pnpm build:linux:x64"},
               {"os": "ubuntu-24.04-arm", "platform": "linux", "arch": "arm64", "build_command": "pnpm build:linux:arm64"}
+            ]' ||
+            inputs.platform == 'win-x64' && '[
+              {"os": "windows-latest", "platform": "win", "arch": "x64", "build_command": "pnpm build:win:x64"}
+            ]' ||
+            inputs.platform == 'win-arm64' && '[
+              {"os": "windows-11-arm", "platform": "win", "arch": "arm64", "build_command": "pnpm build:win:arm64"}
             ]' ||
             inputs.platform == 'mac' && '[
               {"os": "macos-latest", "platform": "mac", "arch": "arm64", "build_command": "pnpm build:mac:arm64"},
@@ -164,7 +172,8 @@ jobs:
   publish:
     needs: [prepare, build]
     runs-on: ubuntu-latest
-    if: always() && needs.build.result == 'success'
+    # 只要还有成功构建的产物就发布，避免个别矩阵任务（如 windows-11-arm）失败导致整个 Release 缺失
+    if: always() && needs.prepare.result == 'success' && needs.build.result != 'cancelled'
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
