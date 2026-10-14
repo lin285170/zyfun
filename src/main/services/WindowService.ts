@@ -748,6 +748,22 @@ export class WindowService {
       mainWindow.show();
     });
 
+    /**
+     * 兜底显示：某些环境下 `ready-to-show` 可能永不触发
+     * （实测：无 GPU / 远程桌面 / 纯软件渲染 swiftshader 时，
+     *  该事件依赖首次绘制合成，可能一直不来，导致窗口"创建了但看不见"）。
+     * 因此 4 秒后若仍未可见，主动居中并 show。
+     */
+    const showFallbackTimer = setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+        logger.warn('ready-to-show 未在 4s 内触发，强制显示主窗口');
+        mainWindow.center();
+        mainWindow.show();
+      }
+    }, 4000);
+    mainWindow.once('show', () => clearTimeout(showFallbackTimer));
+    mainWindow.once('closed', () => clearTimeout(showFallbackTimer));
+
     if (!isPackaged && process.env.ELECTRON_RENDERER_URL) {
       mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
     } else {
