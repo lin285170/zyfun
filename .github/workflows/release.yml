@@ -10,15 +10,16 @@ on:
       platform:
         description: 'Build platform'
         required: true
-        default: 'all'
+        default: 'win-x64'
         type: choice
         options:
-          - all
-          - win
+          # ⚠️ 当前仅构建 Windows x64，其余架构暂时屏蔽（恢复时取消注释即可）
+          # - all
+          # - win
           - win-x64
-          - win-arm64
-          - mac
-          - linux
+          # - win-arm64
+          # - mac
+          # - linux
   push:
     tags:
       - v*.*.*
@@ -58,35 +59,10 @@ jobs:
 
     strategy:
       matrix:
-        include: >-
-          ${{ fromJSON(
-            (github.event_name == 'push' || github.event_name == 'pull_request_target' || inputs.platform == 'all') && '[
-              {"os": "macos-latest", "platform": "mac", "arch": "arm64", "build_command": "pnpm build:mac:arm64"},
-              {"os": "macos-15-intel", "platform": "mac", "arch": "x64", "build_command": "pnpm build:mac:x64"},
-              {"os": "windows-latest", "platform": "win", "arch": "x64", "build_command": "pnpm build:win:x64"},
-              {"os": "windows-11-arm", "platform": "win", "arch": "arm64", "build_command": "pnpm build:win:arm64"},
-              {"os": "ubuntu-latest", "platform": "linux", "arch": "x64", "build_command": "pnpm build:linux:x64"},
-              {"os": "ubuntu-24.04-arm", "platform": "linux", "arch": "arm64", "build_command": "pnpm build:linux:arm64"}
-            ]' ||
-            inputs.platform == 'win-x64' && '[
-              {"os": "windows-latest", "platform": "win", "arch": "x64", "build_command": "pnpm build:win:x64"}
-            ]' ||
-            inputs.platform == 'win-arm64' && '[
-              {"os": "windows-11-arm", "platform": "win", "arch": "arm64", "build_command": "pnpm build:win:arm64"}
-            ]' ||
-            inputs.platform == 'mac' && '[
-              {"os": "macos-latest", "platform": "mac", "arch": "arm64", "build_command": "pnpm build:mac:arm64"},
-              {"os": "macos-15-intel", "platform": "mac", "arch": "x64", "build_command": "pnpm build:mac:x64"}
-            ]' ||
-            inputs.platform == 'win' && '[
-              {"os": "windows-latest", "platform": "win", "arch": "x64", "build_command": "pnpm build:win:x64"},
-              {"os": "windows-11-arm", "platform": "win", "arch": "arm64", "build_command": "pnpm build:win:arm64"}
-            ]' ||
-            inputs.platform == 'linux' && '[
-              {"os": "ubuntu-latest", "platform": "linux", "arch": "x64", "build_command": "pnpm build:linux:x64"},
-              {"os": "ubuntu-24.04-arm", "platform": "linux", "arch": "arm64", "build_command": "pnpm build:linux:arm64"}
-            ]' || '[]'
-          ) }}
+        # ⚠️ 当前仅构建 Windows x64，其余架构（win-arm64 / mac / linux）暂时屏蔽。
+        # 恢复多平台时，把 include 换回依赖 inputs.platform 的三元表达式即可（见 git 历史）。
+        include:
+          - { os: windows-latest, platform: win, arch: x64, build_command: pnpm build:win:x64 }
       fail-fast: false
 
     steps:
