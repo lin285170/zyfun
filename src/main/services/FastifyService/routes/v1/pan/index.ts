@@ -7,9 +7,12 @@
  * POST /api/v1/pan/credentials       保存凭据
  * DEL  /api/v1/pan/credentials       删除凭据
  * POST /api/v1/pan/check             凭据自检
+ * POST /api/v1/pan/qr/create         创建扫码登录会话（返回二维码）
+ * GET  /api/v1/pan/qr/poll?qrId=     轮询扫码状态（确认后回传凭据）
+ * DEL  /api/v1/pan/qr?qrId=          取消扫码会话
  */
 import { request } from '@main/utils/request';
-import { panProxy, panService, panStore } from '@main/services/PanService';
+import { panProxy, panService, panStore, qrLoginService } from '@main/services/PanService';
 import type { IPanDriverId } from '@main/services/PanService/types';
 import type { FastifyPluginAsync } from 'fastify';
 
@@ -91,6 +94,46 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
     if (!driver) return { code: -1, msg: 'driver is required' };
     const ok = await panService.check(driver);
     return { code: 0, data: { driver, ok } };
+  });
+
+  /** 创建扫码登录会话：返回二维码（base64 PNG） */
+  fastify.post<{ Body: { driver: IPanDriverId } }>(`/${API_PREFIX}/qr/create`, async (req) => {
+    const driver = req.body?.driver;
+    if (!driver) return { code: -1, msg: 'driver is required' };
+    const driverObj = panService.getDriver(driver);
+    if (!driverObj) return { code: -1, msg: `未找到驱动：${driver}` };
+    const ctx = await panService.context(driver);
+    const data = await qrLoginService.create(driver, ctx);
+    return { code: 0, data };
+  });
+
+  /** 轮询扫码状态；确认登录后回传凭据（调用方落库） */
+  fastify.get<{ Querystring: { qrId?: string; save?: string } }>(
+    `/${API_PREFIX}/qr/poll`,
+    async (req) => {
+      const qrId = req.query?.qrId;
+      if (!qrId) return { code: -1, msg: 'qrId is required' };
+      const ctx = await panService.context('baidu');
+      const res = await qrLoginService.poll(qrId, ctx);
+      // 默认自动落库，便于前端一步到位；传 save=0 可只取不存
+      if (res.status === 'confirmed' && res.credential && req.query?.save !== '0') {
+        await panStore.set(res.credential.driver, {
+          driver: res.credential.driver,
+          cookie: res.credential.cookie,
+          enabled: true,
+        });
+        const ok = await panService.check(res.credential.driver).catch(() => false);
+        return { code: 0, data: { ...res, saved: true, ok } };
+      }
+      return { code: 0, data: res };
+    },
+  );
+
+  /** 取消扫码会话 */
+  fastify.delete<{ Querystring: { qrId?: string } }>(`/${API_PREFIX}/qr`, async (req) => {
+    const qrId = req.query?.qrId;
+    if (qrId) qrLoginService.cancel(qrId);
+    return { code: 0, data: true };
   });
 };
 

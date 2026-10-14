@@ -101,5 +101,6 @@ export class PanService {
 
 export const panService = new PanService();
 export { panStore };
+export { qrLoginService } from './qrlogin';
 export { panProxy, toProxyUrl } from './proxy';
 export * from './types';
