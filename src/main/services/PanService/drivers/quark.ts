@@ -11,14 +11,8 @@
  * 凭据：Cookie 中的 `__puus` / `__uid`（登录后从浏览器或夸克客户端导出）。
  * 无登录态时 ①② 可读，③④ 会返回 31001（未登录）。
  */
-import {
-  PAN_DRIVER_ID,
-  type IPanContext,
-  type IPanDriver,
-  type IPanFile,
-  type IPanPlayInfo,
-  type IPanShareResult,
-} from '../types';
+import type { IPanContext, IPanDriver, IPanFile, IPanPlayInfo, IPanShareResult } from '../types';
+import { PAN_DRIVER_ID } from '../types';
 
 const API = 'https://drive-pc.quark.cn/1/clouddrive';
 const REFERER = 'https://pan.quark.cn/';
@@ -27,8 +21,8 @@ const UA =
 
 /** 常见分享域名 */
 const LINK_RES = [
-  /https?:\/\/pan\.quark\.cn\/s\/([0-9a-zA-Z]+)/i,
-  /https?:\/\/pan\.quark\.cn\/s\/([0-9a-zA-Z]+)\?pwd=([0-9a-zA-Z]+)/i,
+  /https?:\/\/pan\.quark\.cn\/s\/([0-9a-z]+)/i,
+  /https?:\/\/pan\.quark\.cn\/s\/([0-9a-z]+)\?pwd=([0-9a-z]+)/i,
 ];
 
 interface IQuarkListItem {
@@ -49,9 +43,9 @@ class QuarkDriver implements IPanDriver {
   }
 
   private parse(link: string): { pwdId: string; passcode: string } {
-    const m1 = link.match(/\/s\/([0-9a-zA-Z]+)\?pwd=([0-9a-zA-Z]+)/i);
+    const m1 = link.match(/\/s\/([0-9a-z]+)\?pwd=([0-9a-z]+)/i);
     if (m1) return { pwdId: m1[1], passcode: m1[2] };
-    const m2 = link.match(/\/s\/([0-9a-zA-Z]+)/i);
+    const m2 = link.match(/\/s\/([0-9a-z]+)/i);
     if (m2) return { pwdId: m2[1], passcode: '' };
     throw new Error('无法从链接中解析夸克分享 ID');
   }
@@ -169,21 +163,36 @@ class QuarkDriver implements IPanDriver {
   ): Promise<string> {
     const before = await this.myRootFids(ctx);
 
-    const res = await ctx.request({
-      url: `${API}/share/sharepage/save?pr=ucpro&fr=pc&uc_param_str=`,
-      method: 'POST',
-      headers: this.headers(ctx),
-      data: {
-        fid_list: [fid],
-        fid_token_list: [fidToken],
-        to_pdir_fid: '0',
-        pwd_id: pwdId,
-        stoken,
-        pdir_fid: '0',
-        scene: 'link',
-      },
-      responseType: 'json',
-    });
+    let res: any;
+    try {
+      res = await ctx.request({
+        url: `${API}/share/sharepage/save?pr=ucpro&fr=pc&uc_param_str=`,
+        method: 'POST',
+        headers: this.headers(ctx),
+        data: {
+          fid_list: [fid],
+          fid_token_list: [fidToken],
+          to_pdir_fid: '0',
+          pwd_id: pwdId,
+          stoken,
+          pdir_fid: '0',
+          scene: 'link',
+        },
+        responseType: 'json',
+      });
+    } catch (error: any) {
+      const body = error?.response?.data;
+      const code = Number(body?.code ?? 0);
+      const status = error?.response?.status;
+      if (code === 41020) {
+        throw new Error(
+          '夸克转存失败：分享文件 token 校验异常（通常为文件在分享内已变更或链接过期），请重新进入该影片。',
+        );
+      }
+      throw new Error(
+        `夸克转存失败：HTTP ${status ?? '?'} code=${code || '?'} msg=${body?.message ?? error?.message ?? ''}`,
+      );
+    }
     const d = res.data ?? {};
     if (d.code !== 0) {
       throw new Error(`夸克转存失败：code=${d.code} msg=${d.message ?? ''}（需登录 Cookie，或该分享禁止转存）`);
@@ -259,13 +268,31 @@ class QuarkDriver implements IPanDriver {
 
   /** ④ 取直链 */
   private async getDownloadUrl(fids: string[], ctx: IPanContext): Promise<string> {
-    const res = await ctx.request({
-      url: `${API}/file/download?pr=ucpro&fr=pc&uc_param_str=`,
-      method: 'POST',
-      headers: this.headers(ctx),
-      data: { fids },
-      responseType: 'json',
-    });
+    let res: any;
+    try {
+      res = await ctx.request({
+        url: `${API}/file/download?pr=ucpro&fr=pc&uc_param_str=`,
+        method: 'POST',
+        headers: this.headers(ctx),
+        data: { fids },
+        responseType: 'json',
+      });
+    } catch (error: any) {
+      // 夸克部分业务错误直接以 HTTP 4xx 返回，真正的 code 在响应体里，
+      // 必须解出 body 才能给出可读提示（否则只剩 "status code 400"）。
+      const body = error?.response?.data;
+      const code = Number(body?.code ?? 0);
+      const status = error?.response?.status;
+      if (code === 23018) {
+        throw new Error(
+          '夸克直链获取失败：文件超出当前账号的下载大小限制（code=23018）。' +
+            '免费账号对单文件下载有上限，需开通夸克会员，或改选体积更小的资源 / 其他网盘。',
+        );
+      }
+      throw new Error(
+        `夸克取直链失败：HTTP ${status ?? '?'} code=${code || '?'} msg=${body?.message ?? error?.message ?? ''}`,
+      );
+    }
     const d = res.data ?? {};
     if (d.code !== 0) {
       // 实测：免费账号对大文件有下载限制，返回 23018
