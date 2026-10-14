@@ -203,11 +203,13 @@
           <span class="title" @click="handleDialogForm('proxy')">{{ $t('pages.setting.base.security.proxy') }}</span>
           <span class="title" @click="handleDialogForm('ua')">{{ $t('pages.setting.base.security.ua') }}</span>
           <span class="title" @click="handleDialogForm('dns')">{{ $t('pages.setting.base.security.dns') }}</span>
+          <span class="title" @click="handleDialog('panAccount')">网盘账号</span>
         </t-space>
 
         <dialog-ua-view v-model:visible="isVisible.ua" :data="dialogFormData" @submit="onDialogSubmit" />
         <dialog-proxy-view v-model:visible="isVisible.proxy" :data="dialogFormData" @submit="onDialogSubmit" />
         <dialog-dns-view v-model:visible="isVisible.dns" :data="dialogFormData" @submit="onDialogSubmit" />
+        <dialog-pan-account-view v-model:visible="isVisible.panAccount" />
       </t-form-item>
       <t-form-item :label="$t('pages.setting.base.permission.title')" name="permission">
         <t-space align="center">
@@ -269,10 +271,17 @@ const createAsyncComponentRefs = (components: string[]): Record<string, any> => 
   return refs;
 };
 
-const componentNames = ['Ua', 'Proxy', 'Dns', 'Update', 'Sniffer', 'Barrage'];
+const componentNames = ['Ua', 'Proxy', 'Dns', 'Update', 'Sniffer', 'Barrage', 'PanAccount'];
 
-const { DialogUaView, DialogProxyView, DialogDnsView, DialogUpdateView, DialogSnifferView, DialogBarrageView } =
-  createAsyncComponentRefs(componentNames);
+const {
+  DialogUaView,
+  DialogProxyView,
+  DialogDnsView,
+  DialogUpdateView,
+  DialogSnifferView,
+  DialogBarrageView,
+  DialogPanAccountView,
+} = createAsyncComponentRefs(componentNames);
 const DialogDisclaimerView = defineAsyncComponent(() => import('@/pages/Disclaimer.vue'));
 
 const storePlayer = usePlayerStore();
@@ -289,6 +298,7 @@ const isVisible = ref({
   dns: false,
   update: false,
   disclaimer: false,
+  panAccount: false,
 });
 const dialogFormData = ref({ data: {} });
 
