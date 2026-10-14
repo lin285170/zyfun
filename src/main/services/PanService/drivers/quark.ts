@@ -311,8 +311,21 @@ class QuarkDriver implements IPanDriver {
   async check(ctx: IPanContext): Promise<boolean> {
     if (!ctx.credential?.cookie) return false;
     try {
+      // ⚠️ 实测（2026-10-14）：原用 `/member` 接口会误报 false，
+      // 但 Cookie 本身有效（`/config` 与 `file/sort` 均返回 code=0）。
+      // 改为**列本人网盘根目录**——这才能真正验证「已登录且可读写」。
+      const qs = new URLSearchParams({
+        pr: 'ucpro',
+        fr: 'pc',
+        pdir_fid: '0',
+        force: '0',
+        _page: '1',
+        _size: '1',
+        _fetch_total: '1',
+        _sort: 'file_type:asc,updated_at:desc',
+      });
       const res = await ctx.request({
-        url: `${API}/../member?pr=ucpro&fr=pc&uc_param_str=`,
+        url: `${API}/file/sort?${qs.toString()}`,
         method: 'GET',
         headers: this.headers(ctx),
         responseType: 'json',
