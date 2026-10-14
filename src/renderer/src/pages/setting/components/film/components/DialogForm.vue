@@ -67,7 +67,7 @@
           <t-form-item :label="$t('pages.film.field.ext')" name="ext">
             <t-textarea
               v-model="formData.ext"
-              :autosize="{ minRows: 1, maxRows: 3 }"
+              :autosize="{ minRows: 8, maxRows: 24 }"
               :placeholder="$t('common.placeholder.input')"
             />
           </t-form-item>

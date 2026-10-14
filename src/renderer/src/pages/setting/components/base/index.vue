@@ -203,7 +203,9 @@
           <span class="title" @click="handleDialogForm('proxy')">{{ $t('pages.setting.base.security.proxy') }}</span>
           <span class="title" @click="handleDialogForm('ua')">{{ $t('pages.setting.base.security.ua') }}</span>
           <span class="title" @click="handleDialogForm('dns')">{{ $t('pages.setting.base.security.dns') }}</span>
-          <span class="title" @click="handleDialog('panAccount')">网盘账号</span>
+          <t-button theme="primary" variant="outline" size="small" @click="handleDialog('panAccount')"
+            >网盘账号</t-button
+          >
         </t-space>
 
         <dialog-ua-view v-model:visible="isVisible.ua" :data="dialogFormData" @submit="onDialogSubmit" />

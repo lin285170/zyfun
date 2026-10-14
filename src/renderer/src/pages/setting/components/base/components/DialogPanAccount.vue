@@ -98,7 +98,6 @@
     </template>
   </t-dialog>
 </template>
-
 <script setup lang="ts">
 import { MessagePlugin } from 'tdesign-vue-next';
 import { computed, ref, watch } from 'vue';
@@ -139,8 +138,8 @@ const supportsQr = (d: string) => d === 'baidu';
 
 async function load() {
   const [dRes, cRes] = await Promise.all([fetchPanDrivers(), fetchPanCredentials()]);
-  const drivers: Array<{ id: string; name: string }> = (dRes as any)?.data ?? [];
-  const creds: any[] = (cRes as any)?.data ?? [];
+  const drivers: Array<{ id: string; name: string }> = (dRes as any) ?? [];
+  const creds: any[] = (cRes as any) ?? [];
   const byId = new Map(creds.map((c) => [c.driver, c]));
   rows.value = drivers.map((d) => {
     const c = byId.get(d.id) as any;
@@ -150,7 +149,7 @@ async function load() {
 
 watch(formVisible, (v) => {
   if (v) {
-    load().catch(() => {});
+    load().catch((e) => MessagePlugin.error(`加载网盘列表失败：${String(e)}`));
     editing.value = '';
     qrVisible.value = false;
   } else {
@@ -188,7 +187,7 @@ async function onCheck(driver: string) {
   checking.value = driver;
   try {
     const res: any = await checkPanCredential(driver);
-    const ok = !!res?.data?.ok;
+    const ok = !!res?.ok;
     const row = rows.value.find((r) => r.driver === driver);
     if (row) row.ok = ok;
     ok ? MessagePlugin.success('凭据可用') : MessagePlugin.warning('凭据不可用或已过期');
@@ -258,7 +257,7 @@ async function onScan(driver: string) {
   qrCancelled = false;
   try {
     const res: any = await createPanQr(driver);
-    const d = res?.data;
+    const d = res;
     if (!d?.qrId) {
       MessagePlugin.warning(d?.hint || '该网盘暂不支持扫码登录，请手动填写 Cookie');
       return;
@@ -282,7 +281,7 @@ function loopPoll() {
   qrTimer = setTimeout(async () => {
     try {
       const res: any = await pollPanQr(qrId.value, true);
-      const d = res?.data ?? {};
+      const d = res ?? {};
       qrStatus.value = d.status || 'waiting';
       if (d.message) qrHint.value = d.message;
 
@@ -305,7 +304,6 @@ function loopPoll() {
   }, 1200);
 }
 </script>
-
 <style scoped lang="less">
 .pan-account {
   max-height: 60vh;
