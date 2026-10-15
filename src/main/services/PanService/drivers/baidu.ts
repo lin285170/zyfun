@@ -696,10 +696,11 @@ class BaiduDriver implements IPanDriver {
 
     // ⑥ 走 PCS locatedownload 取直链（无需 access_token）
     const dlink = await this.getPcsDlink(playPath, ctx);
-    const hdrs = this.withRandsk(ctx, this.session.randsk);
+    // ⚠️ PCS 直链拉流按「网盘客户端 UA」鉴权：实测浏览器 UA → 403，
+    // netdisk UA + Range → 206，且**不需要 Cookie/Referer**（Python 端到端验证形态）。
     return {
       url: dlink,
-      headers: { 'User-Agent': UA, Referer: `${HOST}/`, Cookie: String(hdrs.Cookie ?? '') },
+      headers: { 'User-Agent': PCS_UA },
     };
   }
 
