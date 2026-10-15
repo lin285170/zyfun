@@ -42,13 +42,23 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
 
     try {
       const headers: Record<string, string> = { ...(entry.headers ?? {}) };
-      // 透传 Range，保证拖动可用；
-      // ⚠️ 请求不带 Range 时注入**闭合首段** bytes=0-4194303（4MB）：
-      //   - 无 Range 整文件请求会拖 692MB 级全量下载必超 60s 超时；
-      //   - 开放区间 bytes=0- 会被 PCS 直链 403 拒绝（实测）；闭合区间一律放行。
-      //   - 播放器从 content-range 照样能拿到文件总大小，后续请求会自带 Range。
-      const range = req.headers.range;
-      headers.Range = range ? String(range) : 'bytes=0-4194303';
+      // ⚠️ Range 归一化（决定播放器能否首包成功）：
+      //   - 无 Range（探测/整取）      → 闭合首段 bytes=0-4194303（4MB），避免全量下载超时；
+      //   - **开放区间 bytes=N-**（Chromium video 标签首包就是这个！）
+      //     → 转成闭合 bytes=N-(N+4MB)。实测 PCS 直链对开放区间一律 403，
+      //       播放器会卡在黑屏转圈（2026-10-15 GUI 实测铁证）。
+      //   - 闭合区间原样透传。
+      const CHUNK = 4194303;
+      const rawRange = String(req.headers.range ?? '').trim();
+      const open = rawRange.match(/^bytes=(\d+)-$/i);
+      if (!rawRange) {
+        headers.Range = `bytes=0-${CHUNK}`;
+      } else if (open) {
+        const start = Number(open[1]);
+        headers.Range = `bytes=${start}-${start + CHUNK}`;
+      } else {
+        headers.Range = rawRange;
+      }
 
       const res = await request.request({
         url: entry.url,
@@ -72,7 +82,8 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
         reply.header('content-type', entry.contentType);
       }
 
-      const status = range ? 206 : (res.status ?? 200);
+      // 一律转发回源的 206/200（我们始终带闭合 Range 回源，正常是 206）
+      const status = res.status ?? 200;
       return reply.code(status).send(Buffer.from(res.data as ArrayBuffer));
     } catch (error) {
       fastify.log.error(error);
