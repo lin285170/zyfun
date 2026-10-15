@@ -28,6 +28,9 @@
  */
 import { createHash } from 'node:crypto';
 
+import { loggerService } from '@main/services/LoggerService';
+import { LOG_MODULE } from '@shared/config/logger';
+
 import { baiduBrowserService } from '../baiduBrowser';
 import type { IPanContext, IPanDriver, IPanFile, IPanPlayInfo, IPanShareResult } from '../types';
 import { PAN_DRIVER_ID } from '../types';
@@ -40,6 +43,14 @@ import { PAN_DRIVER_ID } from '../types';
  * 随后重试即可走通「API 转存 → PCS 直链」。
  */
 export const BAIDU_NEED_VERIFY = 'BAIDU_NEED_VERIFY';
+
+/** 判断文件名是否为可播放媒体（用于从转存目录中挑出第一个视频） */
+const MEDIA_EXT_RE = /\.(?:mp4|mkv|avi|mov|wmv|flv|ts|m2ts|rmvb|webm|m4v|mpg|mpeg|3gp|iso|bdmv)$/i;
+function isMediaName(name: string): boolean {
+  return MEDIA_EXT_RE.test(String(name ?? '').trim());
+}
+
+const logger = loggerService.withContext(LOG_MODULE.FILM_CMS);
 
 const HOST = 'https://pan.baidu.com';
 const PCS_HOST = 'https://pcs.baidu.com';
@@ -91,6 +102,11 @@ class BaiduDriver implements IPanDriver {
     uid: string;
     randsk: string;
     bdstoken: string;
+    /**
+     * 浏览器过验时带回的**实时 Cookie**。
+     * BDCLND 与这套 Cookie 强绑定，必须成对使用（用快照 Cookie 会 errno=-9）。
+     */
+    cookieOverride?: string;
   } | null = null;
 
   match(link: string): boolean {
@@ -120,18 +136,25 @@ class BaiduDriver implements IPanDriver {
       Accept: 'application/json, text/plain, */*',
       ...extra,
     };
-    if (ctx.credential?.cookie) h.Cookie = ctx.credential.cookie;
+    // 过验带回的实时 Cookie 优先于登录快照（两者必须与 BDCLND 配套）
+    const cookie = this.session?.cookieOverride || ctx.credential?.cookie;
+    if (cookie) h.Cookie = cookie;
     return h;
   }
 
   /** 把 randsk 合并进 Cookie（BDCLND） */
-  private withRandsk(ctx: IPanContext, randsk: string, referer?: string): Record<string, string> {
-    const base = ctx.credential?.cookie ?? '';
+  private withRandsk(
+    ctx: IPanContext,
+    randsk: string,
+    referer?: string,
+    extra?: Record<string, string>,
+  ): Record<string, string> {
+    const base = this.session?.cookieOverride || ctx.credential?.cookie || '';
     let cookie = base;
     if (randsk) {
       cookie = /BDCLND=/.test(base) ? base.replace(/BDCLND=[^;]*/g, `BDCLND=${randsk}`) : `${base}; BDCLND=${randsk}`;
     }
-    return this.headers(ctx, { Cookie: cookie, ...(referer ? { Referer: referer } : {}) });
+    return this.headers(ctx, { Cookie: cookie, ...(referer ? { Referer: referer } : {}), ...(extra ?? {}) });
   }
 
   /**
@@ -202,6 +225,30 @@ class BaiduDriver implements IPanDriver {
     }
   }
 
+  /**
+   * 取**当前登录用户**的 bdstoken。
+   *
+   * ⚠️ `/share/init` 页面里的 bdstoken 是「分享页上下文」的，匿名也能拿到；
+   * 用它调 `share/transfer` 会被判 `errno=2 参数错误`。
+   * 转存必须用登录用户自己的 bdstoken（`/api/gettemplatevariable`）。
+   */
+  private async userBdstoken(ctx: IPanContext): Promise<string> {
+    try {
+      const res = await ctx.request({
+        url: `${HOST}/api/gettemplatevariable?fields=${encodeURIComponent('["bdstoken"]')}&channel=chunlei&web=1&app_id=250528&clienttype=0`,
+        method: 'GET',
+        headers: this.headers(ctx),
+        responseType: 'json',
+      });
+      const r = (res.data ?? {}).result;
+      const token = Array.isArray(r) ? '' : String((r as any)?.bdstoken ?? '');
+      if (token) logger.info('[baidu] 已取到登录用户的 bdstoken');
+      return token;
+    } catch {
+      return '';
+    }
+  }
+
   /** 取 shareid / uk（免 Cookie，需完整 surl） */
   private async shortUrlInfo(surlFull: string, ctx: IPanContext) {
     const res = await ctx.request({
@@ -262,9 +309,19 @@ class BaiduDriver implements IPanDriver {
       url: `${HOST}/share/list?${qs.toString()}`,
       method: 'GET',
       headers: this.withRandsk(ctx, randsk, `${HOST}/s/${surlShort}`),
-      responseType: 'json',
+      // 取文本自行解析：百度的 fs_id 是 19 位雪花 ID，交给 JSON.parse 会被
+      // 转成 Number 从而静默丢精度（末尾几位变 0），后续转存必然 errno=2。
+      responseType: 'text',
     });
-    const d = res.data ?? {};
+    const rawText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? {});
+    // 把长数字（≥15 位）先转成字符串再解析，保证 fs_id 原样保留
+    const safeText = rawText.replace(/"fs_id"\s*:\s*(\d{15,})/g, '"fs_id":"$1"');
+    let d: any;
+    try {
+      d = JSON.parse(safeText);
+    } catch {
+      throw new Error('百度文件列表解析失败（响应非 JSON）');
+    }
     if (d.errno !== 0) {
       if (d.errno === -9) throw new Error('百度分享列表需要提取码（errno=-9），请确认链接含 ?pwd=');
       throw new Error(`百度文件列表获取失败：errno=${d.errno} msg=${d.show_msg ?? ''}`);
@@ -317,7 +374,13 @@ class BaiduDriver implements IPanDriver {
       uid,
       randsk: '',
       bdstoken: locals.bdstoken,
+      // 若此前已用浏览器过验过该分享，则连它那套实时 Cookie 一起用上
+      cookieOverride: baiduBrowserService.getCachedCookie(link) || undefined,
     };
+
+    // 转存用的是**登录用户的** bdstoken，而非 /share/init 的分享页 token
+    const userToken = await this.userBdstoken(ctx);
+    if (userToken) this.session.bdstoken = userToken;
 
     // ④ 提取码凭据 randsk
     //    优先用「浏览器过验」缓存下来的 BDCLND：新版 verify 需要 pwd_enc 混淆 +
@@ -335,16 +398,50 @@ class BaiduDriver implements IPanDriver {
       // 仍尝试一次 API 校验（部分老分享仍可用）
       try {
         randsk = await this.verify(surlShort, pwd, locals.bdstoken, ctx);
-      } catch {
-        /* 需要浏览器过验 */
+      } catch (error) {
+        logger.warn(
+          `[baidu] verify 失败（将走浏览器过验）：pwd=${pwd} bdstoken=${locals.bdstoken ? '有' : '无'} err=${(error as Error)?.message}`,
+        );
       }
     }
+    logger.warn(
+      `[baidu] resolve 汇总 pwd="${pwd}" cachedRandsk=${baiduBrowserService.getCachedRandsk(link) ? '有' : '无'} randsk=${randsk ? '有' : '无'} bdstoken=${locals.bdstoken ? '有' : '无'} shareid=${shareid || '空'}`,
+    );
     if (!randsk && pwd) {
       throw new Error(BAIDU_NEED_VERIFY);
     }
     this.session.randsk = randsk;
 
-    const files = await this.listDir('/', ctx, 0);
+    let files: IPanFile[];
+    try {
+      files = await this.listDir('/', ctx, 0);
+    } catch (error) {
+      const msg = String((error as Error)?.message ?? '');
+      if (msg.includes('errno=-9') && pwd) {
+        // randsk 可能是「已解码」形式，而服务端要的是 URL 编码形式（或反之）。
+        // 参照 FongMi 的 .baiducookie：其中存的是 `%2F/%2B/%3D` 这类编码值。
+        // 这里对另一种形式做一次回退尝试。
+        const alt = /%[0-9A-F]{2}/i.test(randsk) ? decodeURIComponent(randsk) : encodeURIComponent(randsk);
+        logger.warn(`[baidu] randsk 首次失败，回退尝试另一种编码形式（altLen=${alt.length}）`);
+        this.session.randsk = alt;
+        try {
+          files = await this.listDir('/', ctx, 0);
+          logger.info('[baidu] 回退编码形式后成功取到文件列表');
+          return {
+            title: files[0]?.name ?? '百度网盘分享',
+            files,
+            shareUrl: link,
+            driver: this.id,
+          };
+        } catch {
+          // 两种形式都失败 → 缓存无效，丢弃并转为浏览器过验
+          baiduBrowserService.clearCache(link);
+          logger.warn(`[baidu] 两种编码形式均失败，已清除缓存，转为浏览器过验：${link}`);
+          throw new Error(BAIDU_NEED_VERIFY);
+        }
+      }
+      throw error;
+    }
     const title = files[0]?.name ?? '百度网盘分享';
     return { title, files, shareUrl: link, driver: this.id };
   }
@@ -358,22 +455,134 @@ class BaiduDriver implements IPanDriver {
   private async transfer(fsId: string, ctx: IPanContext, toPath = '/'): Promise<{ fsId: string; path: string }> {
     if (!this.session) throw new Error('缺少分享会话（请先 resolve）');
     const { surlShort, shareid, uk, randsk, bdstoken } = this.session;
-    const res = await ctx.request({
-      url: `${HOST}/share/transfer?shareid=${shareid}&from=${uk}&bdstoken=${encodeURIComponent(bdstoken)}&channel=chunlei&web=1&app_id=250528&clienttype=0&t=${Date.now()}&surl=${surlShort}`,
-      method: 'POST',
-      headers: this.withRandsk(ctx, randsk, `${HOST}/s/${surlShort}`),
-      data: `fsidlist=${encodeURIComponent(JSON.stringify([Number(fsId)]))}&path=${encodeURIComponent(toPath)}`,
-      responseType: 'json',
-    });
-    const d = res.data ?? {};
-    if (d.errno !== 0) {
+
+    // ⚠️ 百度的 fs_id 是 19 位雪花 ID，超出 JS Number 的 53 位安全精度。
+    // 直接 `Number(fsId)` 会被静默改写（末尾几位变成 0），服务端收到无效 ID
+    // 即返回 `errno=2 参数错误`。必须用 BigInt 精确还原为数字字面量。
+    const fsIdLiteral = /^\d+$/.test(fsId) ? BigInt(fsId).toString() : JSON.stringify(fsId);
+    const body = `fsidlist=${encodeURIComponent(`[${fsIdLiteral}]`)}&path=${encodeURIComponent(toPath)}`;
+    logger.warn(`[baidu] transfer fsId=${fsId} → fsidlist=[${fsIdLiteral}] path=${toPath}`);
+
+    const base = `${HOST}/share/transfer?shareid=${shareid}&from=${uk}&bdstoken=${encodeURIComponent(bdstoken)}&channel=chunlei&web=1&app_id=250528&clienttype=0&t=${Date.now()}`;
+    // 变体依次尝试：带 surl(去前导1) → 不带 surl → 带完整 surl。
+    // `surl` 在不同账号/时期是否必需并不一致，逐个回退比反复试错更省时间。
+    const variants = [
+      { label: 'surl-short', url: `${base}&surl=${surlShort}` },
+      { label: 'no-surl', url: base },
+      { label: 'surl-full', url: `${base}&surl=${this.session.surlFull}` },
+    ];
+
+    let d: any = {};
+    for (const v of variants) {
+      const res = await ctx.request({
+        url: v.url,
+        method: 'POST',
+        headers: this.withRandsk(ctx, randsk, `${HOST}/s/${surlShort}`, {
+          // ⚠️ 关键：transfer 是 POST + 表单体，缺此头服务端无法解析 body，
+          // 会直接返回 errno=2「参数错误」（实测：补上后立即变为 errno=4 已转存）。
+          'Content-Type': 'application/x-www-form-urlencoded',
+        }),
+        data: body,
+        responseType: 'json',
+      });
+      d = res.data ?? {};
+      // errno=4 表示「文件已转存」，同样是成功态：目标路径在 duplicated.list 里。
+      if (d.errno === 0 || d.errno === 4) {
+        logger.info(`[baidu] transfer 成功（变体 ${v.label}，errno=${d.errno}）`);
+        break;
+      }
+      logger.warn(`[baidu] transfer 变体 ${v.label} 失败：errno=${d.errno} msg=${d.show_msg ?? ''}`);
+    }
+    if (d.errno !== 0 && d.errno !== 4) {
       if (d.errno === 200025) throw new Error('百度转存失败：提取码未生效（BDCLND 缺失或失效）');
       throw new Error(`百度转存失败：errno=${d.errno} msg=${d.show_msg ?? ''}`);
     }
-    const item = d.extra?.list?.[0] ?? {};
-    const newFsId = item.to_fs_id ? String(item.to_fs_id) : fsId;
-    const newPath = String(item.to ?? '');
+    // errno=0 → extra.list；errno=4（已转存）→ duplicated.list。两者字段结构一致。
+    const item = d.extra?.list?.[0] ?? d.duplicated?.list?.[0] ?? {};
+    const newFsId = item.to_fs_id ? String(item.to_fs_id) : String(item.fs_id ?? fsId);
+    const newPath = String(item.to ?? item.path ?? '');
+    logger.info(`[baidu] 转存目标 fsId=${newFsId} path=${newPath}`);
     return { fsId: newFsId, path: newPath };
+  }
+
+  /**
+   * 在分享内按「转存后的目录名」下钻，取第一个可播放文件的**转存后路径**。
+   *
+   * 转存过来的常常是整季目录（如 `/李熊猫2026`），而 PCS locatedownload 只接受
+   * 具体文件路径。这里借 `share/list`（已实测可用）遍历分享目录结构，
+   * 按名称匹配到已转存的那个目录，再把分享内的相对路径拼成本人网盘的绝对路径。
+   */
+  private async drillShareToFile(ctx: IPanContext, localRoot: string): Promise<string> {
+    // 分享内层级（如 /动漫/周三/李熊猫2026）与转存后层级（/李熊猫2026）不同，
+    // 因此按「目录名」在分享内定位同名目录，再下钻，最后用**本地根**拼回绝对路径。
+    const rootName = localRoot.split('/').filter(Boolean).pop() ?? '';
+    if (!rootName) return '';
+    const top = await this.listRaw('/', ctx);
+    const target = top.find((f) => f.isDir && f.name === rootName);
+    logger.warn(`[baidu] 下钻定位 rootName="${rootName}" 分享顶层=${top.length} 匹配=${target ? target.path : '无'}`);
+    if (!target) return '';
+
+    const walk = async (dir: string, rel: string, depth: number): Promise<string> => {
+      if (depth > 4) return '';
+      const files = await this.listRaw(dir, ctx);
+      const vid = files.find((f) => !f.isDir && isMediaName(f.name));
+      if (vid) return `${localRoot}/${rel}${vid.name}`.replace(/\/+/g, '/');
+      for (const sub of files.filter((f) => f.isDir)) {
+        const r = await walk(sub.path, `${rel}${sub.name}/`, depth + 1);
+        if (r) return r;
+      }
+      return '';
+    };
+    const found = await walk(target.path, '', 0);
+    if (found) logger.info(`[baidu] 转存目录已下钻到文件：${found}`);
+    return found;
+  }
+
+  /** 列分享内某目录（原始结构，供路径拼装用） */
+  private async listRaw(dir: string, ctx: IPanContext): Promise<{ name: string; isDir: boolean; path: string }[]> {
+    if (!this.session) return [];
+    const { surlShort, shareid, uk, randsk } = this.session;
+    const qs = new URLSearchParams({
+      shareid,
+      uk,
+      dir,
+      page: '1',
+      num: '200',
+      order: 'time',
+      desc: '1',
+      showempty: '0',
+      root: dir === '/' ? '1' : '0',
+      web: '1',
+      channel: 'chunlei',
+      app_id: '250528',
+      clienttype: '0',
+    });
+    const res = await ctx.request({
+      url: `${HOST}/share/list?${qs.toString()}`,
+      method: 'GET',
+      headers: this.withRandsk(ctx, randsk, `${HOST}/s/${surlShort}`),
+      responseType: 'text',
+    });
+    const rawText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? {});
+    const safe = rawText.replace(/"fs_id"\s*:\s*(\d{15,})/g, '"fs_id":"$1"');
+    try {
+      const d = JSON.parse(safe);
+      const list = ((d.list ?? []) as any[]).map((it) => ({
+        name: String(it.server_filename ?? ''),
+        isDir: it.isdir === 1,
+        path: String(it.path ?? ''),
+      }));
+      logger.warn(
+        `[baidu] listRaw dir="${dir}" → errno=${d.errno} 条目=${list.length} [${list
+          .slice(0, 4)
+          .map((x) => `${x.isDir ? '[D]' : '[F]'}${x.name}`)
+          .join(', ')}]`,
+      );
+      return list;
+    } catch {
+      logger.warn(`[baidu] listRaw dir="${dir}" 解析失败，原始响应前 160 字：${rawText.slice(0, 160)}`);
+      return [];
+    }
   }
 
   /**
@@ -467,8 +676,21 @@ class BaiduDriver implements IPanDriver {
     // ④ 转存到本人网盘 → 拿到**本人网盘内的绝对路径**（PCS 按 path 定位）
     const { path } = await this.transfer(fileId, ctx);
     if (!path) throw new Error('百度转存未返回文件路径，无法走 PCS 取直链');
-    // ⑤ 走 PCS locatedownload 取直链（无需 access_token）
-    const dlink = await this.getPcsDlink(path, ctx);
+
+    // ⑤ 若转存结果是**目录**（整包分享很常见），下钻到第一个媒体文件。
+    //    PCS locatedownload 只接受具体文件，传目录会报 31074。
+    let playPath = path;
+    if (!isMediaName(path.split('/').pop() ?? '')) {
+      const deep = await this.drillShareToFile(ctx, path);
+      if (deep) {
+        playPath = deep;
+      } else {
+        throw new Error('百度转存目录内未找到可播放的媒体文件');
+      }
+    }
+
+    // ⑥ 走 PCS locatedownload 取直链（无需 access_token）
+    const dlink = await this.getPcsDlink(playPath, ctx);
     const hdrs = this.withRandsk(ctx, this.session.randsk);
     return {
       url: dlink,

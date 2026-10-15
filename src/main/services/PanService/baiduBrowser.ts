@@ -23,8 +23,8 @@ const HOST = 'https://pan.baidu.com';
 /** 与浏览器登录共用的分区，确保带登录态 */
 const PARTITION = 'persist:panlogin-baidu';
 
-/** 过验结果缓存：shareUrl → randsk(BDCLND) */
-const RANDSK_CACHE = new Map<string, string>();
+/** 过验结果缓存：shareUrl → { randsk, cookie } */
+const RANDSK_CACHE = new Map<string, { randsk: string; cookie: string }>();
 
 const SESSION_TTL_MS = 3 * 60 * 1000;
 const POLL_INTERVAL_MS = 1200;
@@ -44,6 +44,8 @@ interface IVerifySession {
   status: IBaiduVerifyStatus;
   message?: string;
   randsk?: string;
+  /** 页面是否已加载完成（避免抓到瞬态 Cookie） */
+  loaded: boolean;
   window: BrowserWindow | null;
   timer: ReturnType<typeof setInterval> | null;
 }
@@ -53,11 +55,27 @@ class BaiduBrowserService {
 
   /** 是否已有该分享的 randsk 缓存 */
   getCachedRandsk(shareUrl: string): string {
-    return RANDSK_CACHE.get(shareUrl) ?? '';
+    return RANDSK_CACHE.get(shareUrl)?.randsk ?? '';
+  }
+
+  /**
+   * 取与该 randsk **配套**的完整 Cookie。
+   *
+   * 实测结论：BDCLND 与「取得它的那套 Cookie」强绑定 —— 把它拿到另一套 Cookie 下使用，
+   * 服务端一律返回 errno=-9（即便同为一个账号）。因此 driver 必须改用这里的实时 Cookie，
+   * 而不是 pan-credentials.json 里登录时保存的快照。
+   */
+  getCachedCookie(shareUrl: string): string {
+    return RANDSK_CACHE.get(shareUrl)?.cookie ?? '';
   }
 
   hasCached(shareUrl: string): boolean {
     return RANDSK_CACHE.has(shareUrl);
+  }
+
+  /** 清除某个分享的缓存（用于丢弃无效 randsk，强制重新过验） */
+  clearCache(shareUrl: string): void {
+    RANDSK_CACHE.delete(shareUrl);
   }
 
   /** 打开分享页并等待校验完成，返回会话 id（异步，需轮询） */
@@ -91,10 +109,16 @@ class BaiduBrowserService {
       shareUrl,
       createdAt: Date.now(),
       status: 'waiting',
+      loaded: false,
       window: win,
       timer: null,
     };
     this.sessions.set(id, vs);
+
+    // 页面加载完成前不下结论：百度在跳转过程中也可能写入占位 Cookie
+    win.webContents.on('did-finish-load', () => {
+      vs.loaded = true;
+    });
 
     win.loadURL(url).catch((error) => {
       vs.status = 'failed';
@@ -153,19 +177,68 @@ class BaiduBrowserService {
       return;
     }
     if (!s.window || s.window.isDestroyed()) return;
+    // 等待页面真正加载完成，避免把跳转过程中的占位 Cookie 当成有效凭据
+    if (!s.loaded) return;
 
-    const all = await s.window.webContents.session.cookies.get({ domain: '.baidu.com' });
-    const bdclnd = all.find((c) => c.name === 'BDCLND');
-    if (!bdclnd?.value) return;
+    // 以「页面自身视角」取凭据：实测发现页面里的 BDCLND 往往是 host-only
+    // （挂在 pan.baidu.com），用 session.cookies.get({domain:'.baidu.com'}) 取不到同一个值，
+    // 会拿到空值或失效值，表现为后续 share/list 报 errno=-9。
+    const probe = await s.window.webContents
+      .executeJavaScript(
+        `(function(){try{
+          var m = document.cookie.match(/(?:^|;\\s*)BDCLND=([^;]*)/);
+          return JSON.stringify({
+            url: location.href.slice(0,150),
+            bdclnd: m ? m[1] : '',
+            shown: (document.body && document.body.innerText || '').replace(/\\s+/g,' ').slice(0,140)
+          });
+        }catch(e){return '';}})()`,
+      )
+      .catch(() => '');
 
-    const randsk = decodeURIComponent(bdclnd.value).trim();
-    if (!randsk) return;
+    if (!probe) return;
 
-    RANDSK_CACHE.set(s.shareUrl, randsk);
-    s.randsk = randsk;
+    let page: { url?: string; bdclnd?: string; shown?: string };
+    try {
+      page = JSON.parse(probe);
+    } catch {
+      return;
+    }
+
+    const pageUrl = String(page.url ?? '');
+    // 被重定向到登录页 → 登录态失效，明确告知用户
+    if (pageUrl.includes('/login')) {
+      s.status = 'failed';
+      s.message = '百度登录态已失效，请先在「网盘账号」中重新登录百度';
+      this.cancel(s.id);
+      return;
+    }
+
+    const raw = String(page.bdclnd ?? '').trim();
+    if (!raw) return;
+
+    // 注意：driver 侧是「原样拼回 Cookie」（withRandsk 直接 `BDCLND=${randsk}`），
+    // 故这里必须使用 document.cookie 的原始形式，不能再做 decodeURIComponent。
+    // 同时把该分区的**完整实时 Cookie** 一并取回：BDCLND 与这套 Cookie 是配套的，
+    // 只带走 BDCLND 而用别处的快照 Cookie 会一律被判 errno=-9。
+    let cookieStr = '';
+    try {
+      const all = await s.window.webContents.session.cookies.get({});
+      cookieStr = all
+        .filter((c) => c.name && c.value)
+        .map((c) => `${c.name}=${c.value}`)
+        .join('; ');
+    } catch {
+      /* 取不到则退回 driver 自带 Cookie */
+    }
+
+    logger.info(
+      `[baidu-window] 已从页面取得 BDCLND（长度 ${raw.length}，前 24 字符=${raw.slice(0, 24)}，含%编码=${/%[0-9A-F]{2}/i.test(raw)}），同步 Cookie ${cookieStr.split(';').length} 项`,
+    );
+    RANDSK_CACHE.set(s.shareUrl, { randsk: raw, cookie: cookieStr });
+    s.randsk = raw;
     s.status = 'success';
     s.message = '校验成功，已获取提取码凭据';
-    logger.info(`百度分享过验成功：${s.shareUrl}`);
     this.cancel(s.id);
   }
 }
