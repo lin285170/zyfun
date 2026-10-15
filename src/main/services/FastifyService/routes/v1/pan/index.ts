@@ -34,10 +34,12 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
     try {
       const headers: Record<string, string> = { ...(entry.headers ?? {}) };
       // 透传 Range，保证拖动可用；
-      // ⚠️ 请求不带 Range 时**必须注入 bytes=0-**：网盘直链对「无 Range 整文件」
-      // 请求会全量下载（692MB 级必超 60s 超时拖死播放），回 206 分片则是所有播放器的标准姿势。
+      // ⚠️ 请求不带 Range 时注入**闭合首段** bytes=0-4194303（4MB）：
+      //   - 无 Range 整文件请求会拖 692MB 级全量下载必超 60s 超时；
+      //   - 开放区间 bytes=0- 会被 PCS 直链 403 拒绝（实测）；闭合区间一律放行。
+      //   - 播放器从 content-range 照样能拿到文件总大小，后续请求会自带 Range。
       const range = req.headers.range;
-      headers.Range = range ? String(range) : 'bytes=0-';
+      headers.Range = range ? String(range) : 'bytes=0-4194303';
 
       const res = await request.request({
         url: entry.url,
