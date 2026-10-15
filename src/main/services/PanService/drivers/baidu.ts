@@ -346,7 +346,16 @@ class BaiduDriver implements IPanDriver {
     const { surlFull, surlShort, pwd } = this.parse(link);
 
     // ① bdstoken（/share/init，兼容老/新两种页面结构）
-    const locals = await this.initShare(surlShort, pwd, ctx);
+    //    ⚠️ 非致命：/share/init 是被百度风控限流的重灾区（高频访问后返回无字段页面），
+    //    而排除法实测转存对 bdstoken **零依赖**（shareid/uk 走免 Cookie 的 shorturlinfo，
+    //    uid 走 uinfo）；提取码走浏览器过验也不依赖它。取不到就降级继续。
+    let locals: IInitLocals;
+    try {
+      locals = await this.initShare(surlShort, pwd, ctx);
+    } catch (error) {
+      logger.warn(`[baidu] /share/init 失败（降级继续，不依赖 bdstoken）：${(error as Error)?.message ?? error}`);
+      locals = { bdstoken: '', csrf: '', shareid: '', share_uk: '', uk: '', loginstate: 0 };
+    }
 
     // ② shareid / uk：shorturlinfo 实测更稳定，失败再退回页面字段
     let shareid = '';

@@ -33,9 +33,11 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
 
     try {
       const headers: Record<string, string> = { ...(entry.headers ?? {}) };
-      // 透传 Range，保证拖动可用
+      // 透传 Range，保证拖动可用；
+      // ⚠️ 请求不带 Range 时**必须注入 bytes=0-**：网盘直链对「无 Range 整文件」
+      // 请求会全量下载（692MB 级必超 60s 超时拖死播放），回 206 分片则是所有播放器的标准姿势。
       const range = req.headers.range;
-      if (range) headers.Range = String(range);
+      headers.Range = range ? String(range) : 'bytes=0-';
 
       const res = await request.request({
         url: entry.url,
