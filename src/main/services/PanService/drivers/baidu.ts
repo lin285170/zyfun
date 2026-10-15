@@ -518,7 +518,8 @@ class BaiduDriver implements IPanDriver {
     const rootName = localRoot.split('/').filter(Boolean).pop() ?? '';
     if (!rootName) return '';
     const top = await this.listRaw('/', ctx);
-    const target = top.find((f) => f.isDir && f.name === rootName);
+    // 优先按「目录+同名」匹配；退化到仅同名（若接口目录字段缺失，能否列内容由 walk 验证）
+    const target = top.find((f) => f.isDir && f.name === rootName) ?? top.find((f) => f.name === rootName);
     logger.warn(`[baidu] 下钻定位 rootName="${rootName}" 分享顶层=${top.length} 匹配=${target ? target.path : '无'}`);
     if (!target) return '';
 
@@ -569,7 +570,9 @@ class BaiduDriver implements IPanDriver {
       const d = JSON.parse(safe);
       const list = ((d.list ?? []) as any[]).map((it) => ({
         name: String(it.server_filename ?? ''),
-        isDir: it.isdir === 1,
+        // ⚠️ 老版 share/list 不返回 isdir，目录类型在 category（0=文件, 1=目录）；
+        // 只看 isdir 会把分享目录误判为文件，导致下钻匹配不到（实测 2026-10-15）。
+        isDir: it.isdir === 1 || it.category === 1,
         path: String(it.path ?? ''),
       }));
       logger.warn(
