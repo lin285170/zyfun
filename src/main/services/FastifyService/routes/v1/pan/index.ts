@@ -43,30 +43,37 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
     try {
       const headers: Record<string, string> = { ...(entry.headers ?? {}) };
       // ⚠️ Range 归一化（决定播放器能否首包成功）：
-      //   - 无 Range（探测/整取）      → 闭合首段 bytes=0-4194303（4MB），避免全量下载超时；
+      //   - 无 Range / 非标准       → 回源闭合首段 bytes=0-(SEG)；
       //   - **开放区间 bytes=N-**（Chromium video 标签首包就是这个！）
-      //     → 转成闭合 bytes=N-(N+4MB)。实测 PCS 直链对开放区间一律 403，
-      //       播放器会卡在黑屏转圈（2026-10-15 GUI 实测铁证）。
-      //   - 闭合区间原样透传。
-      const CHUNK = 4194303;
+      //     → 转成闭合 bytes=N-(N+SEG)。实测 PCS 直链对开放区间一律 403，
+      //       播放器会卡在黑屏转圈（2026-10-15 GUI 实测铁证）；
+      //   - 显式闭合区间**夹紧到最多 SEG**（播放器会发 bytes=0-8388607 这类大区间，
+      //     原样透传在免费线路必超时）。
+      // 段长 1MB：免费线路实测 ~135KB/s，4MB 段单请求就要 30s+（FongMi 同为 1024KB）。
+      const SEG = 1048575;
       const rawRange = String(req.headers.range ?? '').trim();
-      const open = rawRange.match(/^bytes=(\d+)-$/i);
-      if (!rawRange) {
-        headers.Range = `bytes=0-${CHUNK}`;
-      } else if (open) {
-        const start = Number(open[1]);
-        headers.Range = `bytes=${start}-${start + CHUNK}`;
+      const m = rawRange.match(/^bytes=(\d+)-(\d*)$/i);
+      if (!rawRange || !m) {
+        headers.Range = `bytes=0-${SEG}`;
       } else {
-        headers.Range = rawRange;
+        const start = Number(m[1]);
+        const end = m[2] ? Math.min(Number(m[2]), start + SEG) : start + SEG;
+        headers.Range = `bytes=${start}-${end}`;
       }
+      const t0 = Date.now();
+      fastify.log.info(`[pan-proxy] ${req.method} 客户端Range=${rawRange || '(无)'} → 回源 ${headers.Range}`);
 
       const res = await request.request({
         url: entry.url,
         method: 'GET',
         headers,
         responseType: 'arraybuffer',
-        timeout: 60000,
+        // 免费线路单段 1MB 约 8s；播放器并发时可能翻数倍，给足余量
+        timeout: 180000,
       });
+      fastify.log.info(
+        `[pan-proxy] 完成 ${headers.Range} → ${res.status} ${(res.data as ArrayBuffer)?.byteLength ?? 0}B ${Date.now() - t0}ms`,
+      );
 
       // 回传关键响应头
       const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'];
@@ -86,6 +93,9 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
       const status = res.status ?? 200;
       return reply.code(status).send(Buffer.from(res.data as ArrayBuffer));
     } catch (error) {
+      fastify.log.error(
+        `[pan-proxy] 失败 客户端Range=${req.headers.range ?? '(无)'} err=${(error as Error)?.message ?? error}`,
+      );
       fastify.log.error(error);
       return reply.code(502).send('proxy fetch failed');
     }
