@@ -568,13 +568,15 @@ class BaiduDriver implements IPanDriver {
     const safe = rawText.replace(/"fs_id"\s*:\s*(\d{15,})/g, '"fs_id":"$1"');
     try {
       const d = JSON.parse(safe);
-      const list = ((d.list ?? []) as any[]).map((it) => ({
-        name: String(it.server_filename ?? ''),
-        // ⚠️ 老版 share/list 不返回 isdir，目录类型在 category（0=文件, 1=目录）；
-        // 只看 isdir 会把分享目录误判为文件，导致下钻匹配不到（实测 2026-10-15）。
-        isDir: it.isdir === 1 || it.category === 1,
-        path: String(it.path ?? ''),
-      }));
+      const list = ((d.list ?? []) as any[]).map((it) => {
+        const name = String(it.server_filename ?? '');
+        // ⚠️ share/list 的 category 是 xpan 语义：0=目录, 1=视频, 2=音频, 3=图片…
+        // （实测 2026-10-15：顶层目录 category=0、站内 .mkv/.mp4 全部 category=1，
+        // 按「1=目录」判定会把文件当目录、把目录当文件，两头全错。）
+        // 判定：显式 isdir=1，或 category=0 且名字不带媒体扩展名（扩展名是最强信号）。
+        const isDir = it.isdir === 1 || (it.category === 0 && !isMediaName(name));
+        return { name, isDir, path: String(it.path ?? '') };
+      });
       logger.warn(
         `[baidu] listRaw dir="${dir}" → errno=${d.errno} 条目=${list.length} [${list
           .slice(0, 4)
