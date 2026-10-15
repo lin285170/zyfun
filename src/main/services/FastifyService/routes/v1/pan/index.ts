@@ -31,6 +31,15 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
     const entry = panProxy.get(token);
     if (!entry) return reply.code(404).send('token expired or not found');
 
+    // ⚠️ HEAD = 渲染层 checkPlayable 的媒体类型探测第一站，必须**不回源**立即应答：
+    // 网盘免费线路回源拉首段要 20~40s，HEAD 跟着等必然拖垮探测超时 →
+    // 判 unknown → 误走 CDP sniffer → 整个播放挂掉（实测 2026-10-15）。
+    if (req.method === 'HEAD') {
+      reply.header('Accept-Ranges', 'bytes');
+      if (entry.contentType) reply.header('Content-Type', entry.contentType);
+      return reply.code(200).send();
+    }
+
     try {
       const headers: Record<string, string> = { ...(entry.headers ?? {}) };
       // 透传 Range，保证拖动可用；
@@ -56,6 +65,12 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
         if (v != null) reply.header(k, String(v));
       }
       if (!reply.getHeader('accept-ranges')) reply.header('Accept-Ranges', 'bytes');
+      // 回源 content-type 缺失或是 octet-stream 时，用登记的媒体类型覆盖
+      // （百度 PCS 恒回 application/octet-stream，播放器与类型探测都需要准确 MIME）
+      const ct = String(reply.getHeader('content-type') ?? '');
+      if (entry.contentType && (!ct || ct.includes('octet-stream'))) {
+        reply.header('content-type', entry.contentType);
+      }
 
       const status = range ? 206 : (res.status ?? 200);
       return reply.code(status).send(Buffer.from(res.data as ArrayBuffer));

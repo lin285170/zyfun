@@ -46,6 +46,23 @@ export const BAIDU_NEED_VERIFY = 'BAIDU_NEED_VERIFY';
 
 /** 判断文件名是否为可播放媒体（用于从转存目录中挑出第一个视频） */
 const MEDIA_EXT_RE = /\.(?:mp4|mkv|avi|mov|wmv|flv|ts|m2ts|rmvb|webm|m4v|mpg|mpeg|3gp|iso|bdmv)$/i;
+
+/** 扩展名 → 响应给播放器的 MIME（与渲染层 MIME_TO_EXTENSION 可逆对应） */
+const PLAY_MIME: Record<string, string> = {
+  mp4: 'video/mp4',
+  m4v: 'video/mp4',
+  mkv: 'video/x-matroska',
+  mov: 'video/quicktime',
+  webm: 'video/webm',
+  ts: 'video/mp2t',
+  m2ts: 'video/mp2t',
+  avi: 'video/x-msvideo',
+  flv: 'video/x-flv',
+  wmv: 'video/x-ms-wmv',
+  mpg: 'video/mpeg',
+  mpeg: 'video/mpeg',
+  '3gp': 'video/3gpp',
+};
 function isMediaName(name: string): boolean {
   return MEDIA_EXT_RE.test(String(name ?? '').trim());
 }
@@ -707,9 +724,14 @@ class BaiduDriver implements IPanDriver {
     const dlink = await this.getPcsDlink(playPath, ctx);
     // ⚠️ PCS 直链拉流按「网盘客户端 UA」鉴权：实测浏览器 UA → 403，
     // netdisk UA + Range → 206，且**不需要 Cookie/Referer**（Python 端到端验证形态）。
+    // contentType：PCS 回源恒是 application/octet-stream，会让渲染层类型探测判 unknown
+    // 而误走 sniffer；按转存文件扩展名登记真实 MIME 交给代理覆盖回传。
+    const ext = (playPath.split('.').pop() ?? '').toLowerCase();
+    const mime = PLAY_MIME[ext] ?? 'video/mp4';
     return {
       url: dlink,
       headers: { 'User-Agent': PCS_UA },
+      contentType: mime,
     };
   }
 

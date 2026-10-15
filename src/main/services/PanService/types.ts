@@ -81,6 +81,12 @@ export interface IPanPlayInfo {
   headers?: Record<string, string>;
   /** 直链过期时间（ms 时间戳，0 表示未知） */
   expiresAt?: number;
+  /**
+   * 响应播放器时的 MIME 类型。网盘直链（尤其百度 PCS）回源常是
+   * application/octet-stream，会让渲染层 checkPlayable 判定 unknown 而误走 sniffer；
+   * 代理据此覆盖回传，并在 HEAD 探测时直接返回。
+   */
+  contentType?: string;
 }
 
 /** 驱动运行上下文 */
@@ -121,13 +127,13 @@ export interface IPanDriver {
   credentialFields: Array<'cookie' | 'token' | 'refreshToken'>;
 
   /** 判断是否由本驱动处理该链接 */
-  match(link: string): boolean;
+  match: (link: string) => boolean;
 
   /** 解析分享链接 → 文件列表 */
-  resolve(link: string, ctx: IPanContext): Promise<IPanShareResult>;
+  resolve: (link: string, ctx: IPanContext) => Promise<IPanShareResult>;
 
   /** 取播放直链 */
-  play(
+  play: (
     fileId: string,
     ctx: IPanContext,
     share?: {
@@ -136,10 +142,10 @@ export interface IPanDriver {
       /** 分享侧文件令牌（转存必需，取自 resolve 结果的 IPanFile.token） */
       token?: string;
     },
-  ): Promise<IPanPlayInfo>;
+  ) => Promise<IPanPlayInfo>;
 
   /** 凭据自检（可选） */
-  check?(ctx: IPanContext): Promise<boolean>;
+  check?: (ctx: IPanContext) => Promise<boolean>;
 }
 
 /** 从一段文本里挑选出第一个可被某驱动处理的分享链接 */
