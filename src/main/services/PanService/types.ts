@@ -87,6 +87,16 @@ export interface IPanPlayInfo {
    * 代理据此覆盖回传，并在 HEAD 探测时直接返回。
    */
   contentType?: string;
+  /**
+   * 该直链允许的上游并发数（缺省 6）。
+   *
+   * 各网盘的限速模型不同（2026-10-16 实测）：
+   *  - 百度：限速在**账号级**，多连接不但不提速反而降速
+   *    （单连接 216KB/s，2/4/8 并发聚合 129/86/118KB/s），取 2；
+   *  - 夸克/UC/阿里：限速偏**连接级**，多连接可聚合提速
+   *    （FongMi 配置 quark_thread/uc_thread/aliyun_thread 均为 10，而 baidu_thread=1），取 6。
+   */
+  maxUpstream?: number;
 }
 
 /** 驱动运行上下文 */

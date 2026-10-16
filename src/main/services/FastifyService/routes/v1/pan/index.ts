@@ -21,28 +21,44 @@ import type { FastifyPluginAsync } from 'fastify';
 const API_PREFIX = 'pan';
 
 /**
- * 上游并发闸门。
+ * 上游并发闸门（按网盘分别限流）。
  *
- * 免费网盘账号的总带宽是固定的（实测 ~110~135KB/s）：播放器并发发 4 个 Range
- * 请求时，每段只能分到 ~30KB/s，1MB 段要 35s，极易撞上请求层 60s 上限；
- * 限流后每段可跑满带宽（~9s），总量不变但首段更快返回，播放器起播更早。
- * FongMi 对百度线同样限制 `baidu_thread=1`，此处取 2 兼顾起播与吞吐。
+ * 2026-10-16 实测各网盘限速模型不同：
+ *  - **百度**：限速在账号级，多连接不提速反而降速（单连接 216KB/s，
+ *    2/4/8 并发聚合 129/86/118KB/s）→ 只给 2 路（FongMi 配置 `baidu_thread=1` 同理）；
+ *  - **夸克/UC/阿里**：限速偏连接级，多连接可聚合提速
+ *    （FongMi `quark_thread/uc_thread/aliyun_thread` 均为 10）→ 默认 6 路。
+ *
+ * 免费账号总带宽固定，过多并发只会让每段都吃不饱、撞上请求层 60s 上限。
  */
-const MAX_UPSTREAM = 2;
-let upstreamActive = 0;
-const upstreamWaiters: Array<() => void> = [];
-function acquireUpstream(): Promise<void> {
-  if (upstreamActive < MAX_UPSTREAM) {
-    upstreamActive++;
+const DEFAULT_MAX_UPSTREAM = 6;
+interface IGate {
+  active: number;
+  waiters: Array<() => void>;
+}
+const gates = new Map<number, IGate>();
+function getGate(limit: number): IGate {
+  let g = gates.get(limit);
+  if (!g) {
+    g = { active: 0, waiters: [] };
+    gates.set(limit, g);
+  }
+  return g;
+}
+function acquireUpstream(limit: number): Promise<void> {
+  const g = getGate(limit);
+  if (g.active < limit) {
+    g.active++;
     return Promise.resolve();
   }
-  return new Promise<void>((resolve) => upstreamWaiters.push(resolve));
+  return new Promise<void>((resolve) => g.waiters.push(resolve));
 }
-function releaseUpstream(): void {
-  const next = upstreamWaiters.shift();
+function releaseUpstream(limit: number): void {
+  const g = getGate(limit);
+  const next = g.waiters.shift();
   if (next)
     next(); // 槽位直接移交，计数不变
-  else upstreamActive--;
+  else g.active--;
 }
 
 const api: FastifyPluginAsync = async (fastify): Promise<void> => {
@@ -88,8 +104,10 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
       const t0 = Date.now();
       fastify.log.info(`[pan-proxy] ${req.method} 客户端Range=${rawRange || '(无)'} → 回源 ${headers.Range}`);
 
-      // 并发闸门 + 请求层 60s 上限（getTimeout 的 MAX_TIMEOUT，写更大也会被降级为默认 10s）
-      await acquireUpstream();
+      // 并发闸门（按网盘上限）+ 请求层 60s 上限
+      // （getTimeout 的 MAX_TIMEOUT，写更大也会被降级为默认 10s）
+      const limit = entry.maxUpstream ?? DEFAULT_MAX_UPSTREAM;
+      await acquireUpstream(limit);
       let res: { status?: number; headers?: Record<string, unknown>; data?: ArrayBuffer };
       try {
         res = await request.request({
@@ -100,7 +118,7 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
           timeout: 60000,
         });
       } finally {
-        releaseUpstream();
+        releaseUpstream(limit);
       }
       fastify.log.info(
         `[pan-proxy] 完成 ${headers.Range} → ${res.status} ${res.data?.byteLength ?? 0}B ${Date.now() - t0}ms`,

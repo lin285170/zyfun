@@ -732,6 +732,9 @@ class BaiduDriver implements IPanDriver {
       url: dlink,
       headers: { 'User-Agent': PCS_UA },
       contentType: mime,
+      // 百度限速是账号级的：实测单连接 216KB/s，2/4/8 并发聚合反而降到
+      // 129/86/118KB/s，多连接只会互相抢带宽（FongMi 也配 baidu_thread=1）。
+      maxUpstream: 2,
     };
   }
 
