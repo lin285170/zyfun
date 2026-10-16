@@ -178,13 +178,18 @@ class QuarkDriver implements IPanDriver {
   ): Promise<string> {
     const before = await this.myRootFids(ctx);
 
-    // 已存在同名**目录** → 直接复用：避免重复转存把同名目录越堆越多，
-    // 也绕开「转存被同名覆盖后既无新 fid 又无法 diff」的死局。
+    // 已存在同名项 → **先校验可用性**再复用：列表里可能残留已失效条目
+    // （实测 2026-10-16：同名项能列出但 file/download 报 file not found，
+    //   复用它会让播放器拿到无效直链 → 403），不可用则照常转存。
     if (name) {
       for (const [f, n] of before) {
         if (n === name) {
-          logger.info(`[quark] 网盘已存在同名项「${name}」，跳转存直接复用 fid=${f}`);
-          return f;
+          if (await this.probeDownloadable(f, ctx)) {
+            logger.info(`[quark] 网盘已存在同名项「${name}」，校验可用，跳转存直接复用 fid=${f}`);
+            return f;
+          }
+          logger.warn(`[quark] 同名项「${name}」已失效（取直链失败），改为正常转存`);
+          break;
         }
       }
     }
@@ -234,10 +239,10 @@ class QuarkDriver implements IPanDriver {
     const added = [...after.keys()].filter((f) => !before.has(f));
     if (added.length) return added[0];
 
-    // 仍无新增（转存被同名项覆盖，不会产生新 fid）→ 按名称回查复用
+    // 仍无新增（转存被同名项覆盖，不会产生新 fid）→ 按名称回查复用（同样先校验）
     if (name) {
       for (const [f, n] of after) {
-        if (n === name) {
+        if (n === name && (await this.probeDownloadable(f, ctx))) {
           logger.info(`[quark] 转存未产生新 fid，按名称复用已有「${name}」fid=${f}`);
           return f;
         }
@@ -408,6 +413,28 @@ class QuarkDriver implements IPanDriver {
     }
     // 会话项不足则退回完整 Cookie（避免因格式差异反而更差）
     return picked.length >= 2 ? picked.join('; ') : full;
+  }
+
+  /**
+   * 轻量校验：该 fid 当前是否**真的可取直链**。
+   * 用于「按名复用」前排除列表里的失效残留条目 —— 实测存在
+   * 「能列出但 file/download 报 file not found」的条目，
+   * 复用它会让播放器拿到无效直链（CDN 回 403）。校验失败即改走正常转存。
+   */
+  private async probeDownloadable(fid: string, ctx: IPanContext): Promise<boolean> {
+    try {
+      const res = await ctx.request({
+        url: `${API}/file/download?pr=ucpro&fr=pc&uc_param_str=`,
+        method: 'POST',
+        headers: { ...this.headers(ctx), Cookie: this.downloadCookie(ctx) },
+        data: { fids: [fid] },
+        responseType: 'json',
+      });
+      const d = (res.data ?? {}) as { code?: number; data?: Array<{ download_url?: string }> };
+      return d.code === 0 && Boolean(d.data?.[0]?.download_url);
+    } catch {
+      return false;
+    }
   }
 
   async check(ctx: IPanContext): Promise<boolean> {
