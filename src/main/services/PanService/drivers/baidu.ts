@@ -69,6 +69,10 @@ function isMediaName(name: string): boolean {
 
 const logger = loggerService.withContext(LOG_MODULE.FILM_CMS);
 
+/** 解析结果缓存：分享链接 → { 文件树, 时间 }。降低 share/list 调用量（风控主因）。 */
+const RESOLVE_CACHE = new Map<string, { files: IPanFile[]; ts: number }>();
+const RESOLVE_TTL = 10 * 60 * 1000;
+
 const HOST = 'https://pan.baidu.com';
 const PCS_HOST = 'https://pcs.baidu.com';
 const UA =
@@ -113,6 +117,9 @@ class BaiduDriver implements IPanDriver {
   private session: {
     surlFull: string;
     surlShort: string;
+    /** 原始分享链接与提取码（供浏览器上下文调用 share/list、sharedownload） */
+    link?: string;
+    pwd?: string;
     shareid: string;
     uk: string;
     /** 当前登录用户 uid（PCS 签名用），来自 /share/init 的 uk */
@@ -307,6 +314,17 @@ class BaiduDriver implements IPanDriver {
   private async listDir(dir: string, ctx: IPanContext, depth: number): Promise<IPanFile[]> {
     if (depth > 4 || !this.session) return [];
     const { surlShort, shareid, uk, randsk } = this.session;
+
+    // 优先走**真实浏览器上下文**：主进程 HTTP 直连 /share/list 被连续调用后
+    // 会被百度判 `errno=9013 账号环境有风险`，而同一时刻浏览器上下文里调用正常
+    // （实测 2026-10-16）。失败再回退主进程 HTTP。
+    if (this.session.link) {
+      const text = await baiduBrowserService.shareList(this.session.link, this.session.pwd ?? '', dir);
+      const parsed = this.parseShareList(text);
+      if (parsed) return this.mapFileNodes(parsed, ctx, depth);
+      if (text) logger.warn('[baidu] 浏览器上下文 share/list 未成功，回退主进程 HTTP');
+    }
+
     const qs = new URLSearchParams({
       shareid,
       uk,
@@ -331,19 +349,42 @@ class BaiduDriver implements IPanDriver {
       responseType: 'text',
     });
     const rawText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? {});
-    // 把长数字（≥15 位）先转成字符串再解析，保证 fs_id 原样保留
-    const safeText = rawText.replace(/"fs_id"\s*:\s*(\d{15,})/g, '"fs_id":"$1"');
-    let d: any;
+    const d = this.parseShareList(rawText);
+    if (!d) {
+      // 解析失败或 errno≠0：再取一次 errno 以便报错
+      let code = '?';
+      let msg = '';
+      try {
+        const j = JSON.parse(rawText.replace(/"fs_id"\s*:\s*(\d{15,})/g, '"fs_id":"$1"'));
+        code = String(j.errno);
+        msg = String(j.show_msg ?? '');
+      } catch {
+        throw new Error('百度文件列表解析失败（响应非 JSON）');
+      }
+      if (code === '-9') throw new Error('百度分享列表需要提取码（errno=-9），请确认链接含 ?pwd=');
+      throw new Error(`百度文件列表获取失败：errno=${code} msg=${msg}`);
+    }
+    return this.mapFileNodes(d, ctx, depth);
+  }
+
+  /**
+   * 解析 share/list 响应文本。
+   * 先用正则把 ≥15 位的 fs_id 转成字符串再 JSON.parse，避免雪花 ID 精度丢失。
+   */
+  private parseShareList(text: string): IBaiduListItem[] | null {
+    if (!text || !text.includes('errno')) return null;
     try {
-      d = JSON.parse(safeText);
+      const d = JSON.parse(text.replace(/"fs_id"\s*:\s*(\d{15,})/g, '"fs_id":"$1"'));
+      if (d.errno === 0) return (d.list ?? []) as IBaiduListItem[];
+      logger.warn(`[baidu] share/list errno=${d.errno} ${d.show_msg ?? ''}`);
+      return null;
     } catch {
-      throw new Error('百度文件列表解析失败（响应非 JSON）');
+      return null;
     }
-    if (d.errno !== 0) {
-      if (d.errno === -9) throw new Error('百度分享列表需要提取码（errno=-9），请确认链接含 ?pwd=');
-      throw new Error(`百度文件列表获取失败：errno=${d.errno} msg=${d.show_msg ?? ''}`);
-    }
-    const list: IBaiduListItem[] = d.list ?? [];
+  }
+
+  /** 列表项 → IPanFile（目录递归下钻） */
+  private async mapFileNodes(list: IBaiduListItem[], ctx: IPanContext, depth: number): Promise<IPanFile[]> {
     const out: IPanFile[] = [];
     for (const it of list) {
       const node: IPanFile = {
@@ -395,6 +436,8 @@ class BaiduDriver implements IPanDriver {
     this.session = {
       surlFull,
       surlShort,
+      link,
+      pwd,
       shareid,
       uk: shareUk,
       uid,
@@ -439,8 +482,21 @@ class BaiduDriver implements IPanDriver {
     this.session.randsk = randsk;
 
     let files: IPanFile[];
+    // 解析缓存：同一分享 10 分钟内直接复用（显著降低 share/list 调用量，
+    // 调用量正是触发百度 errno=9013 风控的主因，2026-10-16 实测）
+    const cachedResolve = RESOLVE_CACHE.get(link);
+    if (cachedResolve && Date.now() - cachedResolve.ts < RESOLVE_TTL) {
+      logger.info('[baidu] 命中解析缓存，跳过 share/list');
+      return {
+        title: cachedResolve.files[0]?.name ?? '百度网盘分享',
+        files: cachedResolve.files,
+        shareUrl: link,
+        driver: this.id,
+      };
+    }
     try {
       files = await this.listDir('/', ctx, 0);
+      RESOLVE_CACHE.set(link, { files, ts: Date.now() });
     } catch (error) {
       const msg = String((error as Error)?.message ?? '');
       if (msg.includes('errno=-9') && pwd) {
@@ -453,6 +509,7 @@ class BaiduDriver implements IPanDriver {
         try {
           files = await this.listDir('/', ctx, 0);
           logger.info('[baidu] 回退编码形式后成功取到文件列表');
+          RESOLVE_CACHE.set(link, { files, ts: Date.now() });
           return {
             title: files[0]?.name ?? '百度网盘分享',
             files,

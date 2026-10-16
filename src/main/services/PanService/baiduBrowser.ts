@@ -245,6 +245,46 @@ class BaiduBrowserService {
     return null;
   }
 
+  /**
+   * 在真实浏览器上下文里列分享目录。
+   *
+   * 原因同 `fetchShareDlink`：主进程 HTTP 直连 `/share/list` 在被连续调用后
+   * 会被百度判定 `errno=9013`（账号环境有风险，2026-10-16 实测，
+   * 同一账号在同一时刻的浏览器上下文里调用正常）。
+   *
+   * @returns 原始响应文本（fs_id 由调用方做字符串化保护），失败返回空串
+   */
+  async shareList(shareUrl: string, pwd: string, dir: string): Promise<string> {
+    const m = shareUrl.match(/\/s\/([\w-]+)/);
+    const surl = m?.[1] ?? '';
+    if (!surl) return '';
+    const win = await this.ensureHiddenWindow(`${HOST}/s/${surl}${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ''}`);
+    if (!win) return '';
+
+    const script = `(async function(){
+      try{
+        var dir = ${JSON.stringify(dir)};
+        var yd = (window.yunData || {});
+        var shareid = yd.SHARE_ID, uk = yd.SHARE_UK;
+        if (!shareid || !uk) {
+          var t = await (await fetch('/share/tplconfig?surl=${surl}' +
+            '&fields=share_uk,shareid&channel=chunlei&web=1&app_id=250528&clienttype=0',
+            {credentials:'include'})).json();
+          var d = (t && t.data) || {};
+          shareid = shareid || d.shareid; uk = uk || d.share_uk || d.uk;
+        }
+        if (!shareid || !uk) return '';
+        var qs = 'shareid=' + shareid + '&uk=' + uk + '&dir=' + encodeURIComponent(dir) +
+          '&page=1&num=200&order=time&desc=1&showempty=0&root=' + (dir === '/' ? '1' : '0') +
+          '&web=1&channel=chunlei&app_id=250528&clienttype=0';
+        var r = await fetch('/share/list?' + qs, {credentials:'include'});
+        return await r.text();
+      }catch(e){ return ''; }
+    })()`;
+
+    return String(await win.webContents.executeJavaScript(script).catch(() => ''));
+  }
+
   /** 确保存在一个已加载目标 URL 的隐藏窗口（同一分区） */
   private async ensureHiddenWindow(url: string): Promise<BrowserWindow | null> {
     try {
