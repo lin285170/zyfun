@@ -13,12 +13,15 @@
  */
 import { Buffer } from 'node:buffer';
 
+import { loggerService } from '@main/services/LoggerService';
 import { panLoginWindowService, panProxy, panService, panStore, qrLoginService } from '@main/services/PanService';
 import type { IPanDriverId, IPanPlayInfo } from '@main/services/PanService/types';
 import { request } from '@main/utils/request';
+import { LOG_MODULE } from '@shared/config/logger';
 import type { FastifyPluginAsync } from 'fastify';
 
 const API_PREFIX = 'pan';
+const logger = loggerService.withContext(LOG_MODULE.FILM_CMS);
 
 /**
  * 段缓存 + 多连接预取引擎（对齐 FongMi 的 wex）。
@@ -102,7 +105,11 @@ function fetchSegment(entry: IPanPlayInfo, st: IProxyState, idx: number): Promis
       }
       st.segs.delete(idx);
       return null;
-    } catch {
+    } catch (error) {
+      // 真实原因必须落日志：此前静默吞掉导致排查困难（2026-10-16）
+      logger.warn(
+        `[pan-proxy] 段 ${idx} 回源失败（bytes=${idx * SEG_SIZE}-${idx * SEG_SIZE + SEG_SIZE}）：${(error as Error)?.message ?? error}`,
+      );
       st.segs.delete(idx);
       return null;
     } finally {
@@ -208,8 +215,32 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
       prefetchAhead(entry, st, lastIdx);
       return reply.code(206).send(slice);
     } catch (error) {
-      fastify.log.error(`[pan-proxy] 失败 客户端Range=${rawRange || '(无)'} err=${(error as Error)?.message ?? error}`);
-      return reply.code(502).send('proxy fetch failed');
+      fastify.log.error(
+        `[pan-proxy] 段引擎失败 客户端Range=${rawRange || '(无)'} err=${(error as Error)?.message ?? error}`,
+      );
+      // 回退：单次透传（段引擎之前的旧行为）。避免引擎自身出问题时
+      // 把原本可播的线路也带崩（夸克线曾因此全 502）。
+      try {
+        const fb = await request.request({
+          url: entry.url,
+          method: 'GET',
+          headers: { ...(entry.headers ?? {}), Range: `bytes=${start}-${end}` },
+          responseType: 'arraybuffer',
+          timeout: 60000,
+        });
+        const buf = Buffer.from((fb.data as ArrayBuffer) ?? new ArrayBuffer(0));
+        if (!buf.length) throw new Error('回退响应为空');
+        reply.header('Accept-Ranges', 'bytes');
+        if (entry.contentType) reply.header('content-type', entry.contentType);
+        const cr = String((fb.headers as Record<string, unknown>)?.['content-range'] ?? '');
+        if (cr) reply.header('content-range', cr);
+        reply.header('content-length', String(buf.length));
+        fastify.log.info(`[pan-proxy] 回退单次透传成功 ${buf.length}B`);
+        return reply.code(206).send(buf);
+      } catch (fbError) {
+        fastify.log.error(`[pan-proxy] 回退亦失败：${(fbError as Error)?.message ?? fbError}`);
+        return reply.code(502).send('proxy fetch failed');
+      }
     }
   });
 
