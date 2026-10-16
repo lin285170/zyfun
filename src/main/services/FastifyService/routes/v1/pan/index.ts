@@ -20,6 +20,31 @@ import type { FastifyPluginAsync } from 'fastify';
 
 const API_PREFIX = 'pan';
 
+/**
+ * 上游并发闸门。
+ *
+ * 免费网盘账号的总带宽是固定的（实测 ~110~135KB/s）：播放器并发发 4 个 Range
+ * 请求时，每段只能分到 ~30KB/s，1MB 段要 35s，极易撞上请求层 60s 上限；
+ * 限流后每段可跑满带宽（~9s），总量不变但首段更快返回，播放器起播更早。
+ * FongMi 对百度线同样限制 `baidu_thread=1`，此处取 2 兼顾起播与吞吐。
+ */
+const MAX_UPSTREAM = 2;
+let upstreamActive = 0;
+const upstreamWaiters: Array<() => void> = [];
+function acquireUpstream(): Promise<void> {
+  if (upstreamActive < MAX_UPSTREAM) {
+    upstreamActive++;
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => upstreamWaiters.push(resolve));
+}
+function releaseUpstream(): void {
+  const next = upstreamWaiters.shift();
+  if (next)
+    next(); // 槽位直接移交，计数不变
+  else upstreamActive--;
+}
+
 const api: FastifyPluginAsync = async (fastify): Promise<void> => {
   /**
    * 直链代理：按 token 取回真实直链与请求头，流式转发。
@@ -63,22 +88,28 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
       const t0 = Date.now();
       fastify.log.info(`[pan-proxy] ${req.method} 客户端Range=${rawRange || '(无)'} → 回源 ${headers.Range}`);
 
-      const res = await request.request({
-        url: entry.url,
-        method: 'GET',
-        headers,
-        responseType: 'arraybuffer',
-        // 免费线路单段 1MB 约 8s；播放器并发时可能翻数倍，给足余量
-        timeout: 180000,
-      });
+      // 并发闸门 + 请求层 60s 上限（getTimeout 的 MAX_TIMEOUT，写更大也会被降级为默认 10s）
+      await acquireUpstream();
+      let res: { status?: number; headers?: Record<string, unknown>; data?: ArrayBuffer };
+      try {
+        res = await request.request({
+          url: entry.url,
+          method: 'GET',
+          headers,
+          responseType: 'arraybuffer',
+          timeout: 60000,
+        });
+      } finally {
+        releaseUpstream();
+      }
       fastify.log.info(
-        `[pan-proxy] 完成 ${headers.Range} → ${res.status} ${(res.data as ArrayBuffer)?.byteLength ?? 0}B ${Date.now() - t0}ms`,
+        `[pan-proxy] 完成 ${headers.Range} → ${res.status} ${res.data?.byteLength ?? 0}B ${Date.now() - t0}ms`,
       );
 
       // 回传关键响应头
       const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'];
       for (const k of pass) {
-        const v = (res.headers as any)?.[k];
+        const v = res.headers?.[k];
         if (v != null) reply.header(k, String(v));
       }
       if (!reply.getHeader('accept-ranges')) reply.header('Accept-Ranges', 'bytes');
@@ -91,7 +122,7 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
 
       // 一律转发回源的 206/200（我们始终带闭合 Range 回源，正常是 206）
       const status = res.status ?? 200;
-      return reply.code(status).send(Buffer.from(res.data as ArrayBuffer));
+      return reply.code(status).send(Buffer.from(res.data ?? new ArrayBuffer(0)));
     } catch (error) {
       fastify.log.error(
         `[pan-proxy] 失败 客户端Range=${req.headers.range ?? '(无)'} err=${(error as Error)?.message ?? error}`,
