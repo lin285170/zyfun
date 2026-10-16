@@ -14,51 +14,129 @@
 import { Buffer } from 'node:buffer';
 
 import { panLoginWindowService, panProxy, panService, panStore, qrLoginService } from '@main/services/PanService';
-import type { IPanDriverId } from '@main/services/PanService/types';
+import type { IPanDriverId, IPanPlayInfo } from '@main/services/PanService/types';
 import { request } from '@main/utils/request';
 import type { FastifyPluginAsync } from 'fastify';
 
 const API_PREFIX = 'pan';
 
 /**
- * 上游并发闸门（按网盘分别限流）。
+ * 段缓存 + 多连接预取引擎（对齐 FongMi 的 wex）。
  *
- * 2026-10-16 实测各网盘限速模型不同：
- *  - **百度**：限速在账号级，多连接不提速反而降速（单连接 216KB/s，
- *    2/4/8 并发聚合 129/86/118KB/s）→ 只给 2 路（FongMi 配置 `baidu_thread=1` 同理）；
- *  - **夸克/UC/阿里**：限速偏连接级，多连接可聚合提速
- *    （FongMi `quark_thread/uc_thread/aliyun_thread` 均为 10）→ 默认 6 路。
- *
- * 免费账号总带宽固定，过多并发只会让每段都吃不饱、撞上请求层 60s 上限。
+ * 背景（2026-10-16 抓包实测）：百度**分享下载通道**（appall*.baidupcs.com）
+ * 单连接只有 ~200~270KB/s，但 FongMi 用 8~17 条并发连接把聚合拉到 ~1.5MB/s
+ * （127s 内 137 条连接、195MB）。播放器自身只会顺序拉少量 Range，
+ * 提速必须由代理侧完成：文件切成 1MB 段，收到请求时**立即并行预取后续若干段**并缓存。
  */
+const SEG_SIZE = 1048575;
+const MAX_SEGS = 32; // 每 token 最多缓存 32 段（32MB）
+const IDLE_MS = 60 * 1000; // 空闲超过此时长即停止预取并清理
 const DEFAULT_MAX_UPSTREAM = 6;
-interface IGate {
-  active: number;
+
+interface ISegEntry {
+  data?: Buffer;
+  promise?: Promise<Buffer | null>;
+}
+interface IProxyState {
+  segs: Map<number, ISegEntry>;
+  total: number;
+  lastIdx: number;
+  lastReq: number;
+  inflight: number;
   waiters: Array<() => void>;
 }
-const gates = new Map<number, IGate>();
-function getGate(limit: number): IGate {
-  let g = gates.get(limit);
-  if (!g) {
-    g = { active: 0, waiters: [] };
-    gates.set(limit, g);
+const proxyStates = new Map<string, IProxyState>();
+
+function getState(key: string): IProxyState {
+  const now = Date.now();
+  for (const [k, v] of proxyStates) {
+    if (now - v.lastReq > IDLE_MS && v.inflight === 0) proxyStates.delete(k);
   }
-  return g;
+  let st = proxyStates.get(key);
+  if (!st) {
+    st = { segs: new Map(), total: 0, lastIdx: -1, lastReq: now, inflight: 0, waiters: [] };
+    proxyStates.set(key, st);
+  }
+  return st;
 }
-function acquireUpstream(limit: number): Promise<void> {
-  const g = getGate(limit);
-  if (g.active < limit) {
-    g.active++;
+
+function acquireToken(st: IProxyState, limit: number): Promise<void> {
+  if (st.inflight < limit) {
+    st.inflight++;
     return Promise.resolve();
   }
-  return new Promise<void>((resolve) => g.waiters.push(resolve));
+  return new Promise<void>((resolve) => st.waiters.push(resolve));
 }
-function releaseUpstream(limit: number): void {
-  const g = getGate(limit);
-  const next = g.waiters.shift();
+function releaseToken(st: IProxyState): void {
+  const next = st.waiters.shift();
   if (next)
     next(); // 槽位直接移交，计数不变
-  else g.active--;
+  else st.inflight--;
+}
+
+/** 取一段：命中缓存直接返回；在途则等待；否则发起回源 */
+function fetchSegment(entry: IPanPlayInfo, st: IProxyState, idx: number): Promise<Buffer | null> {
+  const hit = st.segs.get(idx);
+  if (hit?.data) return Promise.resolve(hit.data);
+  if (hit?.promise) return hit.promise;
+
+  const promise = (async (): Promise<Buffer | null> => {
+    const limit = entry.maxUpstream ?? DEFAULT_MAX_UPSTREAM;
+    await acquireToken(st, limit);
+    try {
+      const start = idx * SEG_SIZE;
+      const res = await request.request({
+        url: entry.url,
+        method: 'GET',
+        headers: { ...(entry.headers ?? {}), Range: `bytes=${start}-${start + SEG_SIZE}` },
+        responseType: 'arraybuffer',
+        timeout: 60000,
+      });
+      const buf = Buffer.from((res.data as ArrayBuffer) ?? new ArrayBuffer(0));
+      const cr = String((res.headers as Record<string, unknown>)?.['content-range'] ?? '');
+      const mm = cr.match(/\/(\d+)\s*$/);
+      if (mm) st.total = Number(mm[1]);
+      if (buf.length) {
+        st.segs.set(idx, { data: buf });
+        return buf;
+      }
+      st.segs.delete(idx);
+      return null;
+    } catch {
+      st.segs.delete(idx);
+      return null;
+    } finally {
+      releaseToken(st);
+    }
+  })();
+
+  st.segs.set(idx, { promise });
+  return promise;
+}
+
+/** 后台并行预取后续段（不阻塞当前响应） */
+function prefetchAhead(entry: IPanPlayInfo, st: IProxyState, fromIdx: number): void {
+  const depth = entry.prefetch ?? 6;
+  const limit = entry.maxUpstream ?? DEFAULT_MAX_UPSTREAM;
+  for (let i = fromIdx + 1; i <= fromIdx + depth; i++) {
+    if (Date.now() - st.lastReq > IDLE_MS) return;
+    if (st.total && i * SEG_SIZE >= st.total) return;
+    const e = st.segs.get(i);
+    if (e?.data || e?.promise) continue;
+    if (st.inflight >= limit) return;
+    void fetchSegment(entry, st, i);
+  }
+}
+
+/** 超出上限时优先丢弃「离当前播放位置最远」的段 */
+function evict(st: IProxyState): void {
+  if (st.segs.size <= MAX_SEGS) return;
+  const idxs = [...st.segs.keys()].sort((a, b) => Math.abs(b - st.lastIdx) - Math.abs(a - st.lastIdx));
+  for (const i of idxs) {
+    if (st.segs.size <= MAX_SEGS) break;
+    const e = st.segs.get(i);
+    if (e && !e.promise) st.segs.delete(i);
+  }
 }
 
 const api: FastifyPluginAsync = async (fastify): Promise<void> => {
@@ -81,71 +159,56 @@ const api: FastifyPluginAsync = async (fastify): Promise<void> => {
       return reply.code(200).send();
     }
 
+    const st = getState(token);
+    st.lastReq = Date.now();
+
+    // Range 归一化：客户端无论给什么形态（无 Range / 开放区间 bytes=N- /
+    // 显式大区间 bytes=0-8388607），一律只回**一段 1MB** —— 这样段内能直接命中
+    // 预取缓存，同时规避 PCS 对开放区间的 403（实测 2026-10-15）。
+    const rawRange = String(req.headers.range ?? '').trim();
+    const m = rawRange.match(/^bytes=(\d+)-(\d*)$/i);
+    let start = 0;
+    let end = SEG_SIZE;
+    if (m) {
+      start = Number(m[1]);
+      end = m[2] ? Math.min(Number(m[2]), start + SEG_SIZE) : start + SEG_SIZE;
+    }
+    const t0 = Date.now();
+
     try {
-      const headers: Record<string, string> = { ...(entry.headers ?? {}) };
-      // ⚠️ Range 归一化（决定播放器能否首包成功）：
-      //   - 无 Range / 非标准       → 回源闭合首段 bytes=0-(SEG)；
-      //   - **开放区间 bytes=N-**（Chromium video 标签首包就是这个！）
-      //     → 转成闭合 bytes=N-(N+SEG)。实测 PCS 直链对开放区间一律 403，
-      //       播放器会卡在黑屏转圈（2026-10-15 GUI 实测铁证）；
-      //   - 显式闭合区间**夹紧到最多 SEG**（播放器会发 bytes=0-8388607 这类大区间，
-      //     原样透传在免费线路必超时）。
-      // 段长 1MB：免费线路实测 ~135KB/s，4MB 段单请求就要 30s+（FongMi 同为 1024KB）。
-      const SEG = 1048575;
-      const rawRange = String(req.headers.range ?? '').trim();
-      const m = rawRange.match(/^bytes=(\d+)-(\d*)$/i);
-      if (!rawRange || !m) {
-        headers.Range = `bytes=0-${SEG}`;
-      } else {
-        const start = Number(m[1]);
-        const end = m[2] ? Math.min(Number(m[2]), start + SEG) : start + SEG;
-        headers.Range = `bytes=${start}-${end}`;
+      const firstIdx = Math.floor(start / SEG_SIZE);
+      const lastIdx = Math.floor(end / SEG_SIZE);
+      const parts: Buffer[] = [];
+      for (let i = firstIdx; i <= lastIdx; i++) {
+        const buf = await fetchSegment(entry, st, i);
+        if (!buf) throw new Error(`段 ${i} 拉取失败（客户端Range=${rawRange || '(无)'}）`);
+        parts.push(buf);
       }
-      const t0 = Date.now();
-      fastify.log.info(`[pan-proxy] ${req.method} 客户端Range=${rawRange || '(无)'} → 回源 ${headers.Range}`);
+      const joined = Buffer.concat(parts);
+      const offset = start - firstIdx * SEG_SIZE;
+      const slice = joined.subarray(offset, offset + (end - start + 1));
+      st.lastIdx = lastIdx;
+      evict(st);
 
-      // 并发闸门（按网盘上限）+ 请求层 60s 上限
-      // （getTimeout 的 MAX_TIMEOUT，写更大也会被降级为默认 10s）
-      const limit = entry.maxUpstream ?? DEFAULT_MAX_UPSTREAM;
-      await acquireUpstream(limit);
-      let res: { status?: number; headers?: Record<string, unknown>; data?: ArrayBuffer };
-      try {
-        res = await request.request({
-          url: entry.url,
-          method: 'GET',
-          headers,
-          responseType: 'arraybuffer',
-          timeout: 60000,
-        });
-      } finally {
-        releaseUpstream(limit);
+      // 自行给出响应头（分段拼装后不再透传回源头；content-type 用登记值覆盖
+      // —— 百度 PCS 恒回 application/octet-stream，播放器与类型探测都要准确 MIME）
+      reply.header('Accept-Ranges', 'bytes');
+      if (entry.contentType) reply.header('content-type', entry.contentType);
+      if (st.total) {
+        reply.header('content-range', `bytes ${start}-${start + slice.length - 1}/${st.total}`);
       }
+      reply.header('content-length', String(slice.length));
+
       fastify.log.info(
-        `[pan-proxy] 完成 ${headers.Range} → ${res.status} ${res.data?.byteLength ?? 0}B ${Date.now() - t0}ms`,
+        `[pan-proxy] ${rawRange || '(无Range)'} → 段[${firstIdx}..${lastIdx}] ${slice.length}B ${Date.now() - t0}ms` +
+          ` 缓存${st.segs.size}段/在途${st.inflight}`,
       );
 
-      // 回传关键响应头
-      const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'];
-      for (const k of pass) {
-        const v = res.headers?.[k];
-        if (v != null) reply.header(k, String(v));
-      }
-      if (!reply.getHeader('accept-ranges')) reply.header('Accept-Ranges', 'bytes');
-      // 回源 content-type 缺失或是 octet-stream 时，用登记的媒体类型覆盖
-      // （百度 PCS 恒回 application/octet-stream，播放器与类型探测都需要准确 MIME）
-      const ct = String(reply.getHeader('content-type') ?? '');
-      if (entry.contentType && (!ct || ct.includes('octet-stream'))) {
-        reply.header('content-type', entry.contentType);
-      }
-
-      // 一律转发回源的 206/200（我们始终带闭合 Range 回源，正常是 206）
-      const status = res.status ?? 200;
-      return reply.code(status).send(Buffer.from(res.data ?? new ArrayBuffer(0)));
+      // 后台并行预取后续段（不 await，立即返回当前段）
+      prefetchAhead(entry, st, lastIdx);
+      return reply.code(206).send(slice);
     } catch (error) {
-      fastify.log.error(
-        `[pan-proxy] 失败 客户端Range=${req.headers.range ?? '(无)'} err=${(error as Error)?.message ?? error}`,
-      );
-      fastify.log.error(error);
+      fastify.log.error(`[pan-proxy] 失败 客户端Range=${rawRange || '(无)'} err=${(error as Error)?.message ?? error}`);
       return reply.code(502).send('proxy fetch failed');
     }
   });

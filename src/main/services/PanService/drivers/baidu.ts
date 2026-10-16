@@ -704,7 +704,37 @@ class BaiduDriver implements IPanDriver {
     }
     if (!this.session) throw new Error('缺少分享会话（请先调用 resolve 解析分享链接）');
 
-    // ④ 转存到本人网盘 → 拿到**本人网盘内的绝对路径**（PCS 按 path 定位）
+    // ④ 优先走「分享下载」通道（/api/sharedownload → appall*.baidupcs.com）。
+    //    实测（2026-10-16 抓包）：该通道配合多连接并发可达 ~1.5MB/s，
+    //    而 PCS locatedownload 通道（bd*-cm00）仅 ~0.2MB/s；且**无需转存**，
+    //    顺带绕开 transfer/errno=4 与目录下钻的一整套坑。
+    //    调用放在真实浏览器上下文（规避 errno=9019 指纹风控）。
+    const shareUrl = String(_share?.shareUrl ?? '');
+    if (shareUrl && fileId) {
+      try {
+        const pwd = this.parse(shareUrl).pwd;
+        const got = await baiduBrowserService.fetchShareDlink(shareUrl, pwd, String(fileId));
+        if (got?.dlink) {
+          const ext = (got.name.split('.').pop() ?? '').toLowerCase();
+          return {
+            url: got.dlink,
+            // 分享下载通道的直链：客户端 UA + 账号 Cookie
+            headers: {
+              'User-Agent': PCS_UA,
+              Cookie: String(this.session.cookieOverride || ctx.credential?.cookie || ''),
+            },
+            contentType: PLAY_MIME[ext] ?? 'video/mp4',
+            // 该通道连接级限速明显，多连接可线性提速（对齐 wex 的 8~17 并发）
+            maxUpstream: 12,
+            prefetch: 10,
+          };
+        }
+      } catch (error) {
+        logger.warn(`[baidu] 分享下载通道失败，回退转存链路：${(error as Error)?.message ?? error}`);
+      }
+    }
+
+    // ④（回退）转存到本人网盘 → 拿到**本人网盘内的绝对路径**（PCS 按 path 定位）
     const { path } = await this.transfer(fileId, ctx);
     if (!path) throw new Error('百度转存未返回文件路径，无法走 PCS 取直链');
 
@@ -732,8 +762,8 @@ class BaiduDriver implements IPanDriver {
       url: dlink,
       headers: { 'User-Agent': PCS_UA },
       contentType: mime,
-      // 百度限速是账号级的：实测单连接 216KB/s，2/4/8 并发聚合反而降到
-      // 129/86/118KB/s，多连接只会互相抢带宽（FongMi 也配 baidu_thread=1）。
+      // PCS locatedownload 通道（bd*-cm00）：实测单连接 216KB/s，
+      // 2/4/8 并发聚合反而降到 129/86/118KB/s —— 这条通道并发无益，取 2。
       maxUpstream: 2,
     };
   }

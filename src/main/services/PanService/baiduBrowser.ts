@@ -166,6 +166,119 @@ class BaiduBrowserService {
     }
   }
 
+  /** 隐藏的分享页窗口（复用登录分区），用于在**真实浏览器上下文**中调用分享 API */
+  private hiddenWin: BrowserWindow | null = null;
+  private hiddenUrl = '';
+
+  /**
+   * 在真实浏览器上下文里换取「分享下载」直链。
+   *
+   * 为什么不用主进程 HTTP：`/share/tplconfig` 与 `/api/sharedownload` 对
+   * TLS/JS 指纹敏感，纯 HTTP 客户端连续调用会被判
+   * `errno=9019 您的账号环境存在风险`（实测 2026-10-16）。
+   * 放到真实 Chromium 页面里 fetch（同源、带完整 Cookie/Referer/JS 指纹）即可正常。
+   *
+   * 且该通道直链落在 `appall01.baidupcs.com`，实测聚合可达 ~1.5MB/s，
+   * 而 PCS `locatedownload` 通道（bd*-cm00）只有 ~0.2MB/s。
+   *
+   * @param shareUrl 分享链接（含或不含提取码）
+   * @param pwd 提取码
+   * @param fsId 分享内目标文件的 fs_id
+   * @returns dlink（失败返回空串）
+   */
+  async fetchShareDlink(shareUrl: string, pwd: string, fsId: string): Promise<{ dlink: string; name: string } | null> {
+    const m = shareUrl.match(/\/s\/([\w-]+)/);
+    const surl = m?.[1] ?? '';
+    if (!surl || !fsId) return null;
+    const win = await this.ensureHiddenWindow(`${HOST}/s/${surl}${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ''}`);
+    if (!win) return null;
+
+    const script = `(async function(){
+      try{
+        var surl = ${JSON.stringify(surl)};
+        var fsId = ${JSON.stringify(fsId)};
+        var yd = (window.yunData || {});
+        var sign = yd.SIGN, ts = yd.TIMESTAMP, uk = yd.SHARE_UK, primaryid = yd.SHARE_ID;
+        if (!sign || !uk || !primaryid) {
+          var t = await (await fetch('/share/tplconfig?surl=' + surl +
+            '&fields=sign,timestamp,share_uk,shareid&channel=chunlei&web=1&app_id=250528&clienttype=0',
+            {credentials:'include'})).json();
+          var d = (t && t.data) || {};
+          sign = sign || d.sign; ts = ts || d.timestamp;
+          uk = uk || d.share_uk || d.uk; primaryid = primaryid || d.shareid;
+        }
+        if (!sign || !uk || !primaryid) return JSON.stringify({err:'no-sign', yd:Object.keys(yd).slice(0,20)});
+        var body = 'encrypt=0&product=share&type=dlink&uk=' + uk + '&primaryid=' + primaryid +
+                   '&fid_list=%5B' + fsId + '%5D';
+        var r = await fetch('/api/sharedownload?sign=' + sign + '&timestamp=' + ts +
+          '&channel=chunlei&web=1&app_id=250528&clienttype=0',
+          {method:'POST', credentials:'include',
+           headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8','X-Requested-With':'XMLHttpRequest'},
+           body: body});
+        var j = await r.json();
+        var l = (j && j.list) || [];
+        if (!l.length) return JSON.stringify({err:'no-list', resp:JSON.stringify(j).slice(0,300)});
+        return JSON.stringify({dlink: l[0].dlink, name: l[0].server_filename});
+      }catch(e){ return JSON.stringify({err:String(e)}); }
+    })()`;
+
+    const raw = await win.webContents.executeJavaScript(script).catch(() => '');
+    if (!raw) return null;
+    let out: { dlink?: string; name?: string; err?: string; resp?: string };
+    try {
+      out = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+    if (out.dlink) {
+      const dlink = String(out.dlink).replace(/\\u0026/g, '&');
+      let host = '?';
+      try {
+        host = new URL(dlink).hostname;
+      } catch {
+        /* ignore */
+      }
+      logger.info(`[baidu-share] sharedownload 成功 → 主机 ${host} 文件 ${out.name ?? ''}`);
+      return { dlink, name: String(out.name ?? '') };
+    }
+    logger.warn(`[baidu-share] sharedownload 未取到直链：${out.err ?? ''} ${out.resp ?? ''}`);
+    return null;
+  }
+
+  /** 确保存在一个已加载目标 URL 的隐藏窗口（同一分区） */
+  private async ensureHiddenWindow(url: string): Promise<BrowserWindow | null> {
+    try {
+      if (!this.hiddenWin || this.hiddenWin.isDestroyed()) {
+        this.hiddenWin = new BrowserWindow({
+          width: 1024,
+          height: 720,
+          show: false,
+          webPreferences: {
+            session: electronSession.fromPartition(PARTITION),
+            nodeIntegration: false,
+            contextIsolation: true,
+          },
+        });
+        this.hiddenUrl = '';
+      }
+      if (this.hiddenUrl === url) return this.hiddenWin;
+      const win = this.hiddenWin;
+      await new Promise<void>((resolve) => {
+        const done = (): void => resolve();
+        win.webContents.once('did-finish-load', done);
+        win.loadURL(url).catch(() => resolve());
+        setTimeout(done, 15000);
+      });
+      this.hiddenUrl = url;
+      // 留出页面 JS 自行校验（pwd 在 URL 上时百度会自行完成）的时间
+      await new Promise((r) => setTimeout(r, 1500));
+      return win;
+    } catch (error) {
+      logger.warn(`[baidu-share] 隐藏窗口不可用：${(error as Error)?.message}`);
+      return null;
+    }
+  }
+
   /** 轮询会话 Cookie，命中 BDCLND 即视为校验成功 */
   private async check(s: IVerifySession): Promise<void> {
     if (s.status !== 'waiting') return;
