@@ -383,9 +383,31 @@ class QuarkDriver implements IPanDriver {
       headers: {
         'User-Agent': UA,
         Referer: REFERER,
-        Cookie: ctx.credential.cookie,
+        // 精简 Cookie：夸克 CDN 对完整 32 项 Cookie 会回 412，
+        // 而同样账号的精简会话项可正常 206（FongMi 即只带 __pus/__puus/__uid）
+        Cookie: this.downloadCookie(ctx),
       },
     };
+  }
+
+  /**
+   * 下载相关请求专用的**精简 Cookie**（`__pus` / `__puus` / `__uid`）。
+   *
+   * 实测（2026-10-16，同账号同直链同 UA 对照）：
+   *   完整 32 项 Cookie → 夸克 CDN 恒返 **412 Precondition Failed**
+   *   仅 3 项会话项     → **206 正常**
+   * （API 层对两者都放行，只有 CDN 拉流层严格校验，故只影响下载/拉流请求。）
+   */
+  private downloadCookie(ctx: IPanContext): string {
+    const full = String(ctx.credential?.cookie ?? '');
+    if (!full) return '';
+    const picked: string[] = [];
+    for (const k of ['__pus', '__puus', '__uid']) {
+      const m = full.match(new RegExp(`(?:^|;\\s*)${k}=([^;]*)`));
+      if (m) picked.push(`${k}=${m[1]}`);
+    }
+    // 会话项不足则退回完整 Cookie（避免因格式差异反而更差）
+    return picked.length >= 2 ? picked.join('; ') : full;
   }
 
   async check(ctx: IPanContext): Promise<boolean> {
