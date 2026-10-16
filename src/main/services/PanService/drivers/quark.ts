@@ -11,8 +11,13 @@
  * 凭据：Cookie 中的 `__puus` / `__uid`（登录后从浏览器或夸克客户端导出）。
  * 无登录态时 ①② 可读，③④ 会返回 31001（未登录）。
  */
+import { loggerService } from '@main/services/LoggerService';
+import { LOG_MODULE } from '@shared/config/logger';
+
 import type { IPanContext, IPanDriver, IPanFile, IPanPlayInfo, IPanShareResult } from '../types';
 import { PAN_DRIVER_ID } from '../types';
+
+const logger = loggerService.withContext(LOG_MODULE.FILM_CMS);
 
 const API = 'https://drive-pc.quark.cn/1/clouddrive';
 const REFERER = 'https://pan.quark.cn/';
@@ -149,8 +154,9 @@ class QuarkDriver implements IPanDriver {
     const stoken = await this.getStoken(pwdId, passcode, ctx);
     const files = await this.listDir(pwdId, stoken, '0', ctx, 0);
     const title = files[0]?.name ?? '夸克分享';
-    // 把 stoken 挂在结果上，供 play() 复用（避免重复请求）
+    // 把 stoken 与分享文件表挂在结果上，供 play() 复用（避免重复请求）
     (this as any)._lastStoken = { pwdId, stoken };
+    (this as any)._lastFiles = files;
     return { title, files, shareUrl: link, driver: this.id };
   }
 
@@ -168,8 +174,20 @@ class QuarkDriver implements IPanDriver {
     fid: string,
     fidToken: string,
     ctx: IPanContext,
+    name = '',
   ): Promise<string> {
     const before = await this.myRootFids(ctx);
+
+    // 已存在同名**目录** → 直接复用：避免重复转存把同名目录越堆越多，
+    // 也绕开「转存被同名覆盖后既无新 fid 又无法 diff」的死局。
+    if (name) {
+      for (const [f, n] of before) {
+        if (n === name) {
+          logger.info(`[quark] 网盘已存在同名项「${name}」，跳转存直接复用 fid=${f}`);
+          return f;
+        }
+      }
+    }
 
     let res: any;
     try {
@@ -216,7 +234,19 @@ class QuarkDriver implements IPanDriver {
     const added = [...after.keys()].filter((f) => !before.has(f));
     if (added.length) return added[0];
 
-    throw new Error('夸克转存完成但无法定位新文件（网盘中已存在同名目录，可先删除后重试）');
+    // 仍无新增（转存被同名项覆盖，不会产生新 fid）→ 按名称回查复用
+    if (name) {
+      for (const [f, n] of after) {
+        if (n === name) {
+          logger.info(`[quark] 转存未产生新 fid，按名称复用已有「${name}」fid=${f}`);
+          return f;
+        }
+      }
+    }
+
+    throw new Error(
+      `夸克转存后无法定位文件${name ? `「${name}」` : ''}（网盘中疑似存在同名但内容不同的项，可先在夸克网盘清理后重试）`,
+    );
   }
 
   /** 列出本人网盘根目录：Map<fid, name> */
@@ -249,6 +279,18 @@ class QuarkDriver implements IPanDriver {
   /**
    * 若转存进来的是目录，则下钻找到第一个可播放文件（实测分享常以剧集目录形式提供）。
    */
+  /** 在分享文件树中按 fid 找名称（用于同名复用判断） */
+  private findNameById(list: IPanFile[], fid: string): string {
+    for (const f of list) {
+      if (f.fileId === fid) return f.name;
+      if (f.children?.length) {
+        const r = this.findNameById(f.children, fid);
+        if (r) return r;
+      }
+    }
+    return '';
+  }
+
   private async resolvePlayableFid(fid: string, ctx: IPanContext, depth = 0): Promise<string> {
     if (depth > 3) return fid;
     const children = await this.myListDir(fid, ctx);
@@ -329,7 +371,10 @@ class QuarkDriver implements IPanDriver {
     if (!st) throw new Error('缺少分享上下文（请先调用 resolve 解析分享链接）');
 
     // 转存到本人网盘（转存后 fid 会变，必须用返回的新 fid）
-    const myFid = await this.saveToMyDrive(st.pwdId, st.stoken, fileId, share?.token ?? '', ctx);
+    // 传入目标项名称：saveToMyDrive 据此在「同名已存在」时复用而不是报错
+    const shareFiles = ((this as any)._lastFiles as IPanFile[] | undefined) ?? [];
+    const targetName = this.findNameById(shareFiles, fileId) || String(share?.title ?? '');
+    const myFid = await this.saveToMyDrive(st.pwdId, st.stoken, fileId, share?.token ?? '', ctx, targetName);
     // 若转存进来的是目录，下钻到第一个可播放文件
     const playFid = await this.resolvePlayableFid(myFid, ctx);
     const url = await this.getDownloadUrl([playFid], ctx);
