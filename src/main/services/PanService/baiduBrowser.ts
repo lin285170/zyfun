@@ -186,7 +186,13 @@ class BaiduBrowserService {
    * @param fsId 分享内目标文件的 fs_id
    * @returns dlink（失败返回空串）
    */
-  async fetchShareDlink(shareUrl: string, pwd: string, fsId: string): Promise<{ dlink: string; name: string } | null> {
+  async fetchShareDlink(
+    shareUrl: string,
+    pwd: string,
+    fsId: string,
+    shareid = '',
+    uk = '',
+  ): Promise<{ dlink: string; name: string } | null> {
     const m = shareUrl.match(/\/s\/([\w-]+)/);
     const surl = m?.[1] ?? '';
     if (!surl || !fsId) return null;
@@ -197,17 +203,17 @@ class BaiduBrowserService {
       try{
         var surl = ${JSON.stringify(surl)};
         var fsId = ${JSON.stringify(fsId)};
-        var yd = (window.yunData || {});
-        var sign = yd.SIGN, ts = yd.TIMESTAMP, uk = yd.SHARE_UK, primaryid = yd.SHARE_ID;
-        if (!sign || !uk || !primaryid) {
+        // uk/shareid 由调用方传入（tplconfig 不返回它们，新版页面也无 yunData）
+        var uk = ${JSON.stringify(uk)}, primaryid = ${JSON.stringify(shareid)};
+        var sign = '', ts = '';
+        if (!sign) {
           var t = await (await fetch('/share/tplconfig?surl=' + surl +
-            '&fields=sign,timestamp,share_uk,shareid&channel=chunlei&web=1&app_id=250528&clienttype=0',
+            '&fields=sign,timestamp&channel=chunlei&web=1&app_id=250528&clienttype=0',
             {credentials:'include'})).json();
           var d = (t && t.data) || {};
-          sign = sign || d.sign; ts = ts || d.timestamp;
-          uk = uk || d.share_uk || d.uk; primaryid = primaryid || d.shareid;
+          sign = d.sign; ts = d.timestamp;
         }
-        if (!sign || !uk || !primaryid) return JSON.stringify({err:'no-sign', yd:Object.keys(yd).slice(0,20)});
+        if (!sign || !uk || !primaryid) return JSON.stringify({err:'no-sign', sign:!!sign, uk:uk, pid:primaryid});
         var body = 'encrypt=0&product=share&type=dlink&uk=' + uk + '&primaryid=' + primaryid +
                    '&fid_list=%5B' + fsId + '%5D';
         var r = await fetch('/api/sharedownload?sign=' + sign + '&timestamp=' + ts +
@@ -254,35 +260,39 @@ class BaiduBrowserService {
    *
    * @returns 原始响应文本（fs_id 由调用方做字符串化保护），失败返回空串
    */
-  async shareList(shareUrl: string, pwd: string, dir: string): Promise<string> {
+  async shareList(shareUrl: string, pwd: string, dir: string, shareid = '', uk = ''): Promise<string> {
     const m = shareUrl.match(/\/s\/([\w-]+)/);
     const surl = m?.[1] ?? '';
-    if (!surl) return '';
+    if (!surl || !shareid || !uk) return '';
     const win = await this.ensureHiddenWindow(`${HOST}/s/${surl}${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ''}`);
     if (!win) return '';
 
     const script = `(async function(){
       try{
         var dir = ${JSON.stringify(dir)};
-        var yd = (window.yunData || {});
-        var shareid = yd.SHARE_ID, uk = yd.SHARE_UK;
-        if (!shareid || !uk) {
-          var t = await (await fetch('/share/tplconfig?surl=${surl}' +
-            '&fields=share_uk,shareid&channel=chunlei&web=1&app_id=250528&clienttype=0',
-            {credentials:'include'})).json();
-          var d = (t && t.data) || {};
-          shareid = shareid || d.shareid; uk = uk || d.share_uk || d.uk;
-        }
-        if (!shareid || !uk) return '';
-        var qs = 'shareid=' + shareid + '&uk=' + uk + '&dir=' + encodeURIComponent(dir) +
+        // 百度 tplconfig 只返回 sign/timestamp（**不含 shareid/uk**），新版分享页
+        // 也没有 window.yunData —— id 必须由调用方传入（driver 用 shorturlinfo 拿到，
+        // 那条接口不受风控）。浏览器上下文只负责被风控的 /share/list 本身。
+        var out = { url: location.href.slice(0,80) };
+        var qs = 'shareid=${shareid}&uk=${uk}&dir=' + encodeURIComponent(dir) +
           '&page=1&num=200&order=time&desc=1&showempty=0&root=' + (dir === '/' ? '1' : '0') +
           '&web=1&channel=chunlei&app_id=250528&clienttype=0';
         var r = await fetch('/share/list?' + qs, {credentials:'include'});
-        return await r.text();
-      }catch(e){ return ''; }
+        var txt = await r.text();
+        if (txt.indexOf('"errno"') < 0) {
+          out.err = 'non-json'; out.body = txt.slice(0, 200); out.status = r.status;
+          return '__DIAG__' + JSON.stringify(out);
+        }
+        return txt;
+      }catch(e){ return '__DIAG__' + JSON.stringify({err: String(e)}); }
     })()`;
 
-    return String(await win.webContents.executeJavaScript(script).catch(() => ''));
+    const raw = String(await win.webContents.executeJavaScript(script).catch(() => ''));
+    if (raw.startsWith('__DIAG__')) {
+      logger.warn(`[baidu-share] 浏览器上下文 share/list 未成功：${raw.slice(8)}`);
+      return '';
+    }
+    return raw;
   }
 
   /** 确保存在一个已加载目标 URL 的隐藏窗口（同一分区） */
@@ -311,7 +321,11 @@ class BaiduBrowserService {
       });
       this.hiddenUrl = url;
       // 留出页面 JS 自行校验（pwd 在 URL 上时百度会自行完成）的时间
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, 3000));
+      const landed = win.webContents.getURL();
+      if (landed && !landed.startsWith('https://pan.baidu.com/s/')) {
+        logger.warn(`[baidu-share] 隐藏窗口最终落在非分享页：${landed.slice(0, 90)}`);
+      }
       return win;
     } catch (error) {
       logger.warn(`[baidu-share] 隐藏窗口不可用：${(error as Error)?.message}`);

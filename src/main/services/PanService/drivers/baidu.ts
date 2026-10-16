@@ -319,7 +319,7 @@ class BaiduDriver implements IPanDriver {
     // 会被百度判 `errno=9013 账号环境有风险`，而同一时刻浏览器上下文里调用正常
     // （实测 2026-10-16）。失败再回退主进程 HTTP。
     if (this.session.link) {
-      const text = await baiduBrowserService.shareList(this.session.link, this.session.pwd ?? '', dir);
+      const text = await baiduBrowserService.shareList(this.session.link, this.session.pwd ?? '', dir, shareid, uk);
       const parsed = this.parseShareList(text);
       if (parsed) return this.mapFileNodes(parsed, ctx, depth);
       if (text) logger.warn('[baidu] 浏览器上下文 share/list 未成功，回退主进程 HTTP');
@@ -770,7 +770,13 @@ class BaiduDriver implements IPanDriver {
     if (shareUrl && fileId) {
       try {
         const pwd = this.parse(shareUrl).pwd;
-        const got = await baiduBrowserService.fetchShareDlink(shareUrl, pwd, String(fileId));
+        const got = await baiduBrowserService.fetchShareDlink(
+          shareUrl,
+          pwd,
+          String(fileId),
+          this.session.shareid,
+          this.session.uk,
+        );
         if (got?.dlink) {
           const ext = (got.name.split('.').pop() ?? '').toLowerCase();
           return {
