@@ -543,8 +543,15 @@ class BaiduDriver implements IPanDriver {
     // 直接 `Number(fsId)` 会被静默改写（末尾几位变成 0），服务端收到无效 ID
     // 即返回 `errno=2 参数错误`。必须用 BigInt 精确还原为数字字面量。
     const fsIdLiteral = /^\d+$/.test(fsId) ? BigInt(fsId).toString() : JSON.stringify(fsId);
-    const body = `fsidlist=${encodeURIComponent(`[${fsIdLiteral}]`)}&path=${encodeURIComponent(toPath)}`;
-    logger.warn(`[baidu] transfer fsId=${fsId} → fsidlist=[${fsIdLiteral}] path=${toPath}`);
+    // ★ sekey 必须放在 **表单体** 里（且是解码后的 randsk）。实测：带上它之后
+    //   `share/transfer` 不再依赖 bdstoken（bdstoken 为空也能 errno=0 转存成功），
+    //   而 bdstoken 只在登录后的 web 会话里短期有效，是过去必须反复扫码的根因。
+    const sekey = randsk ? decodeURIComponent(randsk) : '';
+    const sekeyQs = sekey ? `&sekey=${encodeURIComponent(sekey)}` : '';
+    const body = `fsidlist=${encodeURIComponent(`[${fsIdLiteral}]`)}&path=${encodeURIComponent(toPath)}${sekeyQs}`;
+    logger.warn(
+      `[baidu] transfer fsId=${fsId} → fsidlist=[${fsIdLiteral}] path=${toPath} sekey=${sekey ? '有' : '无'}`,
+    );
 
     const base = `${HOST}/share/transfer?shareid=${shareid}&from=${uk}&bdstoken=${encodeURIComponent(bdstoken)}&channel=chunlei&web=1&app_id=250528&clienttype=0&t=${Date.now()}`;
     // 变体依次尝试：带 surl(去前导1) → 不带 surl → 带完整 surl。
@@ -728,6 +735,10 @@ class BaiduDriver implements IPanDriver {
       rand: s.rand,
       devuid: s.devuid,
       cuid: s.devuid,
+      // ★ 伪装成 DLNA 投屏客户端，百度才下发 appall01/02 的 P2SP 流媒体通道。
+      //   不带该参数走普通下载通道，实测被限到 ~80 KB/s；带上后单连接 1.6 MB/s+，
+      //   16 线程可达 10 MB/s 量级。
+      origin: 'dlna',
     });
 
     const res = await ctx.request({
@@ -741,7 +752,11 @@ class BaiduDriver implements IPanDriver {
     });
     const d = res.data ?? {};
     // PCS 成功时返回 { urls: [{ url }] }；失败时返回 { error_code, error_msg }
-    const raw = d.urls?.[0]?.url;
+    // 直链池可能混入 d2-ant 等「另一种内容源」，与 appall0x 字节不一致，
+    // 混着用会出现花屏/音画不同步，因此优先只取 appall 主机族。
+    const allUrls: string[] = (d.urls ?? []).map((u: any) => String(u?.url ?? '')).filter(Boolean);
+    const appall = allUrls.filter((u) => /appall\d*\.baidupcs\.com/.test(u));
+    const raw = appall[0] ?? allUrls[0];
     if (!raw) {
       if (d.error_code === 31066) throw new Error('百度 PCS：文件不存在（path 不正确）');
       if (d.error_code === 31074) throw new Error('百度 PCS：目录不可下载（请传具体文件路径）');
