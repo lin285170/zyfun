@@ -184,3 +184,13 @@ jobs:
           tag: ${{ needs.prepare.outputs.tag }}
           artifacts: 'dist/*'
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish Release
+        # 打包并上传完成后把草稿转为正式发布，否则 Releases 页面看不到资产
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release edit "${{ needs.prepare.outputs.tag }}" --draft=false --latest
